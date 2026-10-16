@@ -1,0 +1,36 @@
+{
+  "name": "agentbus-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "packageManager": "pnpm@9.15.4",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' run build",
+    "test": "tsc -b && vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "typecheck": "tsc -b",
+    "test:unit": "vitest run --exclude e2e/**"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2",
+    "@types/node": "^24",
+    "tsup": "^8",
+    "typescript": "^5.9",
+    "vitest": "^5"
+  },
+  "type": "module",
+  "description": "Backend-agnostic message bus for coding agents: Claude Code, Codex, Gemini CLI, API and A2A agents talk, hand out tasks and exchange files.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aviorAlon/agentbus.git"
+  },
+  "homepage": "https://github.com/aviorAlon/agentbus#readme",
+  "bugs": {
+    "url": "https://github.com/aviorAlon/agentbus/issues"
+  }
+}

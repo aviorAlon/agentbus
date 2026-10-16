@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+# agentbus launcher: runs the CLI from this checkout (build first: pnpm tsc -b)
+exec node "$(dirname "$0")/../packages/cli/dist/bin.js" "$@"

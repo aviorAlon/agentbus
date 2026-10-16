@@ -1,0 +1,23 @@
+{
+  "name": "@agentbus/a2a",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@a2a-js/sdk": "^1.3",
+    "@agentbus/core": "workspace:^",
+    "@agentbus/protocol": "workspace:*"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@agentbus/adapter",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@agentbus/core": "workspace:^",
+    "@agentbus/protocol": "workspace:^",
+    "@modelcontextprotocol/sdk": "^1.32",
+    "zod": "^3.25"
+  }
+}

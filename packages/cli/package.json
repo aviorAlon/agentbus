@@ -1,0 +1,30 @@
+{
+  "name": "@agentbus/cli",
+  "version": "0.0.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@agentbus/adapter": "workspace:^",
+    "@agentbus/core": "workspace:^",
+    "@agentbus/driver": "workspace:^",
+    "@agentbus/protocol": "workspace:^",
+    "commander": "^15",
+    "yaml": "^2",
+    "@agentbus/a2a": "workspace:*"
+  },
+  "bin": {
+    "agentbus": "./dist/bin.js"
+  }
+}

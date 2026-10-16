@@ -1,0 +1,26 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/protocol"
+    },
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/a2a"
+    },
+    {
+      "path": "packages/adapter"
+    },
+    {
+      "path": "packages/driver"
+    },
+    {
+      "path": "packages/cli"
+    },
+    {
+      "path": "e2e"
+    }
+  ]
+}
