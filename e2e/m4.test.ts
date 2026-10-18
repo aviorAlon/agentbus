@@ -321,7 +321,7 @@ describe('M4 e2e', () => {
     })
     expect(bot.status).toBe(401)
     // cancel a task from the console
-    const t = bus.tasks.create('me', { to: 'alpha', description: 'to be canceled' })
+    const t = bus.tasks.create({ name: 'me' }, { to: 'alpha', description: 'to be canceled' })
     const canceled = await fetch(`${http}/api/console/tasks/${t.id}/cancel`, {
       method: 'POST',
       headers: humanHeaders(),

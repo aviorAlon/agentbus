@@ -584,11 +584,66 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM messages m JOIN deliveries d ON d.message_id = m.id AND d.recipient = ?
-         WHERE m.room = ? AND m.id > ? AND d.seen_at IS NULL AND d.error IS NULL
+         WHERE m.room = ? AND m.id > ? AND d.seen_at IS NULL AND d.error IS NULL AND d.via != 'standby'
          ORDER BY m.id ASC LIMIT ?`,
       )
       .all(recipient, room, afterId, limit) as Record<string, unknown>[]
     return rows.map((r) => this.toMessage(r))
+  }
+
+  /** Rows in `room` the standby took over (via=standby) after `afterId`, whatever their state. */
+  standbyRowsFor(recipient: string, room: string, afterId: number, limit: number): Message[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM messages m JOIN deliveries d ON d.message_id = m.id AND d.recipient = ?
+         WHERE m.room = ? AND m.id > ? AND d.via = 'standby' AND d.error IS NULL
+         ORDER BY m.id ASC LIMIT ?`,
+      )
+      .all(recipient, room, afterId, limit) as Record<string, unknown>[]
+    return rows.map((r) => this.toMessage(r))
+  }
+
+  /** The standby's inbox: rows handed to it that it has not pulled yet, oldest first. */
+  pendingStandby(recipient: string, limit = 500): Message[] {
+    const rows = this.db
+      .prepare(
+        `SELECT m.* FROM deliveries d JOIN messages m ON m.id = d.message_id
+         WHERE d.recipient = ? AND d.via = 'standby' AND d.seen_at IS NULL AND d.error IS NULL
+         ORDER BY m.id ASC LIMIT ?`,
+      )
+      .all(recipient, limit) as Record<string, unknown>[]
+    return rows.map((r) => this.toMessage(r))
+  }
+
+  /**
+   * Rows the interactive session could still read (mailbox / push, unseen, not dropped),
+   * oldest first, with when they were written — what a standby may take over once overdue.
+   */
+  pendingInteractive(recipient: string, limit = 500): Delivery[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT * FROM deliveries WHERE recipient = ? AND seen_at IS NULL AND error IS NULL
+           AND via IN ('mailbox', 'push', 'push->mailbox') ORDER BY message_id ASC LIMIT ?`,
+        )
+        .all(recipient, limit) as Record<string, unknown>[]
+    ).map(toDelivery)
+  }
+
+  /**
+   * The standby replied in `room`: the rows it pulled there up to `upTo` are handled. The
+   * person's rows are untouched, and a row handed to it mid-turn stays in its inbox.
+   */
+  markStandbyHandledUpTo(recipient: string, room: string, upTo: number): number {
+    const now = this.now()
+    const r = this.db
+      .prepare(
+        `UPDATE deliveries SET seen_at = COALESCE(seen_at, ?), handled_at = ?
+         WHERE recipient = ? AND via = 'standby' AND handled_at IS NULL AND seen_at IS NOT NULL
+           AND message_id IN (SELECT id FROM messages WHERE room = ? AND id <= ?)`,
+      )
+      .run(now, now, recipient, room, upTo)
+    return r.changes
   }
 
   messagesAfter(room: string, afterId: number, limit: number): Message[] {
@@ -644,6 +699,23 @@ export class Store {
       )
       .run(agent, room, id)
     return this.getCursor(agent, room)
+  }
+
+  /** Newest via=standby row the interactive session has been shown in `room`. */
+  getStandbyCursor(agent: string, room: string): number {
+    const r = this.db
+      .prepare('SELECT last_seen_id FROM standby_cursors WHERE agent_name = ? AND room = ?')
+      .get(agent, room) as { last_seen_id: number } | undefined
+    return r?.last_seen_id ?? 0
+  }
+
+  advanceStandbyCursor(agent: string, room: string, id: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO standby_cursors(agent_name, room, last_seen_id) VALUES (?, ?, ?)
+         ON CONFLICT(agent_name, room) DO UPDATE SET last_seen_id = MAX(last_seen_id, excluded.last_seen_id)`,
+      )
+      .run(agent, room, id)
   }
 
   // ------------------------------------------------------------ deliveries
@@ -712,25 +784,32 @@ export class Store {
     return this.getDelivery(messageId, recipient)
   }
 
-  /** Sending in a room means the sender acted on everything it had received there (handled). */
+  /**
+   * Sending in a room means the sender acted on what it had received there, but only on what
+   * it could know about: rows it has seen, or rows pushed into its context. A row that arrived
+   * while it was busy (unseen, in the mailbox) stays unread; otherwise two sessions asking each
+   * other at once swallow each other's answers. The standby's rows are its own business.
+   */
   markHandledUpTo(recipient: string, room: string, upTo: number): number {
     const now = this.now()
     const r = this.db
       .prepare(
         `UPDATE deliveries SET seen_at = COALESCE(seen_at, ?), handled_at = ?
-         WHERE recipient = ? AND handled_at IS NULL
+         WHERE recipient = ? AND handled_at IS NULL AND via != 'standby'
+           AND (seen_at IS NOT NULL OR via IN ('push', 'push->mailbox'))
            AND message_id IN (SELECT id FROM messages WHERE room = ? AND id <= ?)`,
       )
       .run(now, now, recipient, room, upTo)
     return r.changes
   }
 
-  /** Messages written to `recipient` but not yet seen, oldest first (the mailbox). */
+  /** Messages written to `recipient` but not yet seen, oldest first (the mailbox); the standby's rows excluded. */
   pendingFor(recipient: string, limit = 500): Message[] {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM deliveries d JOIN messages m ON m.id = d.message_id
-         WHERE d.recipient = ? AND d.seen_at IS NULL AND d.error IS NULL ORDER BY m.id ASC LIMIT ?`,
+         WHERE d.recipient = ? AND d.seen_at IS NULL AND d.error IS NULL AND d.via != 'standby'
+         ORDER BY m.id ASC LIMIT ?`,
       )
       .all(recipient, limit) as Record<string, unknown>[]
     return rows.map((r) => this.toMessage(r))

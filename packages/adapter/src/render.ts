@@ -1,5 +1,6 @@
 import {
   encodeRecords,
+  type InboxResult,
   MESSAGE_TABLE_FIELDS,
   type Message,
   type MessageRow,
@@ -23,11 +24,41 @@ export function renderMessages(messages: Message[]): string {
   return `${BOUNDARY_HEADER}\n${encodeRecords(MESSAGE_TABLE_FIELDS, rows)}`
 }
 
+/**
+ * Rows the standby (the hosted session for the same directory) already took while the
+ * person was away. Shown once, for information: the replies are in the room history.
+ */
+export const STANDBY_HEADER =
+  '[agentbus] The rows below were ALREADY HANDLED by the standby session of this directory while ' +
+  'nobody read them here (its replies / task updates are in the room history: `history <room>`). ' +
+  'They are for your information only: do NOT answer them again and do not redo the work. ' +
+  'If the standby got something wrong, send a correction to the sender.'
+
+export function renderStandby(messages: Message[]): string {
+  return `${STANDBY_HEADER}\n${encodeRecords(MESSAGE_TABLE_FIELDS, messages.map(messageToRow))}`
+}
+
+/** What an `inbox` call shows: unread rows, then (separately) what the standby handled. */
+export function renderInbox(r: InboxResult): string {
+  const parts = [renderMessages(r.messages)]
+  if (r.standby?.length) parts.push('', renderStandby(r.standby))
+  return parts.join('\n')
+}
+
 /** Instructions shown to the host model when the MCP server is listed. */
-export function adapterInstructions(name: string, role: 'control' | 'tool'): string {
+export function adapterInstructions(
+  name: string,
+  role: 'control' | 'tool',
+  standby = false,
+): string {
   const lines = [
-    `You are connected to agentbus as agent "${name}" (${role} connection).`,
+    `You are connected to agentbus as agent "${name}" (${role} connection${standby ? ', standby' : ''}).`,
     'Other agents and humans reach you through rooms and direct messages.',
+    ...(standby
+      ? [
+          'You are the STANDBY session for this directory: you receive only what the person working here left unread, and you act for them (answer, execute tasks) without asking them.',
+        ]
+      : []),
     '',
     'Working rules:',
     '- At the start of each turn call `inbox` to pull messages that arrived since your last turn.',

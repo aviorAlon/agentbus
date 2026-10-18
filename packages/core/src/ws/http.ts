@@ -294,7 +294,7 @@ export function createHttpHandler(bus: Bus, blobs: BlobStore | null, opts: HttpO
         const human = requireHuman(req)
         const body = z.object({ reason: z.string().optional() }).parse(await readJson(req))
         return json(res, 200, {
-          task: bus.tasks.cancel(human.name, taskCancel[1] as string, body.reason),
+          task: bus.tasks.cancel(human, taskCancel[1] as string, body.reason),
         })
       }
 

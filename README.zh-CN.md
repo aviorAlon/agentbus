@@ -72,6 +72,8 @@ pnpm tsc -b
 
    `join` 把 token 签到 `~/.agentbus/agents/<名字>.token`，给下次会话（`claude --continue` / `codex resume`）挂上 MCP 工具，装一个 `UserPromptSubmit` hook（你每次输入时未读消息自动出现在它的上下文里），并往项目的 `CLAUDE.md` / `AGENTS.md` 追加一段"你在总线上"的说明。Codex 的 hook 第一次要信任一下：在会话里输入 `/hooks`，把 agentbus 那条标成 trusted。
 
+   它还会把目录登记为**闲时托管（standby）**（`~/.agentbus/agents/<名字>.standby`）：正在跑的 `agentbus up` 会给这个目录起一个同名的托管会话，你的会话一分钟内没读的消息和任务由它代答、代做。前提是 `agentbus up` 在跑、宿主 CLI 已登录；`--no-standby` 关掉。见下面"托管"。
+
 4. 说话。在 frontend 的会话里："问一下 backend 接口什么时候能好"。在 backend 的会话里随便输入一句，问题就在它的上下文里，它会通过总线回答。
 
 退出：`agentbus leave --claude`（加 `--purge` 连身份一起删）。
@@ -86,10 +88,27 @@ pnpm tsc -b
 - **问一句和派个活等法不一样。** 问一句等答案；派活走 `task create`，只等第一条 `working`，然后这一轮就结束，完成汇报由 hook 在后面的回合带回。只有用户说"等它做完"才长等（`--timeout 1800`）。
 - **等超时不是失败。** CLI 会打印、agent 会复述：消息已在对方信箱里，结果会自动带回来。
 - **值班**：说"值班" / "盯着 agentbus"，它就循环 `wait --timeout 300`，来一条处理一条、回一条，直到你叫停。
+- **standby 处理过的只是知会。** 你不在时 standby 代答过的那几条，下次会单列一段（"already handled by your standby"）只出现一次；agent 知悉即可，不会再答一遍。
 
 完整规矩见[用户指南第 3 节](docs/USER_GUIDE.md)；`node e2e/live-dialog.mjs cpu|crossed` 用两个真实 Codex 会话演一遍（消耗 token）。
 
 ## 托管（无人值守）
+
+两种：**闲时托管（standby）**——每个 join 的目录默认开启，人在时人用，人不在时同目录的托管会话只接手没人读的那些；**完全托管**——没有人用的目录，所有消息都由托管会话处理。
+
+### 闲时托管（join 默认）
+
+`agentbus join` 写 `~/.agentbus/agents/<名字>.standby`（host、目录、autonomy）。`agentbus up` 启动时给每个登记各起一个 standby driver（Claude 走 `claude-agent-acp`，Codex 走 `codex-acp`，都用本机已登录的账号），`join` 时若 `up` 在跑会通知它热加载（`POST /api/console/standby/reload`，human token），`agentbus leave` 撤销登记。投递先走你的会话（挂起的 `wait`，再信箱）；`standby.delay_s`（默认 60 秒）后仍没读的投递改标为 `standby` 推给托管会话，由它以你的名义回话或做任务。它的回话只把接手的那几条记为已处理，不动你的阅读位置，所以你下次 `inbox` / hook 会把它们单列、只显示一次，技能让模型不要再答。
+
+要知道的：
+
+- **消耗 token**：standby 每处理一批就是一次真实模型回合（控制台"回合"页能看到）。`agentbus join --claude --no-standby` 对某个目录关掉。
+- **和你的会话不共享上下文**：它是同一目录里另一个会话，有自己的历史；它看得到总线消息和房间历史，看不到你的终端。
+- **改的是同一个工作区**：默认 `autonomy: full`，它接到任务会直接在你的目录里改文件、跑命令，你正好也在改时可能互相覆盖。`--standby-autonomy ask` 让它每次权限先在你的私聊里问。
+- **一分钟延迟是故意的**（先给你的 hook / 值班循环机会）；`agentbus.yaml` 的 `standby.delay_s` 可以改短。
+- 从另一台机器用 `--invite` 加入的目录，那台机器上没有 `up`：在那台机器写 `drivers.yaml`，条目加 `standby: true`（token 自动读 `~/.agentbus/agents/<名字>.token`），跑 `agentbus driver -c drivers.yaml`。
+
+### 完全托管
 
 让总线替你持有某个目录的会话，没人在键盘前也能被叫醒。写一个 `drivers.yaml`：
 
@@ -114,7 +133,7 @@ agentbus ping backend
 
 注意：
 
-- 同一目录不能既托管又以同名"参与"。从 `drivers.yaml` 里拿掉，或加入时 `--name backend-me`。
+- 完全托管和同名"参与"不能同时在线（`name_taken`）。从 `drivers.yaml` 里拿掉改用 standby，或加入时 `--name backend-me`。`drivers.yaml` 条目写 `standby: true` 就是 join 登记的那种闲时托管，可以和同名"参与"共存。
 - driver 继承启动它的终端的环境变量。宿主 CLI 需要的 key（比如走代理用的 `OPENAI_API_KEY`）必须在那个终端里可见。
 - `autonomy: ask` 时，agent 要做需要权限的事（改文件、跑命令）会在你的私聊里问，回 `1` / `allow` 放行，`deny` 拒绝；超时（`permission_timeout_s`，默认 600 秒）按拒绝处理。
 - driver 会按 `autonomy` 切换 ACP 会话模式（Codex：`agent-full-access` / `workspace-write`；Claude：`bypassPermissions` / `default`），要别的模式写 `acp.mode`。
@@ -164,6 +183,7 @@ agentbus join --codex --bus ws://10.0.0.5:7777/ws --invite inv_xxxxxxxx --name b
 | `guard.cap` / `guard.min_interval_ms` | `20` / `2000` | 房间暂停前允许的连续 bot 消息数；每个 agent 的最小发送间隔 |
 | `mailbox.ttl_hours` / `mailbox.max_per_agent` | `24` / `1000` | 离线信箱过期与上限（丢最旧并通知发送方） |
 | `push.seen_timeout_s` | `10` | push 投递多久没读就降级到信箱 |
+| `standby.delay_s` | `60` | 交互式会话多久没读，这条就交给该目录的 standby 会话 |
 | `message.max_text_bytes` | `65536` | 消息大小上限 |
 | `task.deadline_s` / `task.max_turns` | `3600` / `30` | 任务预算默认值 |
 | `heartbeat_timeout_ms` | `30000` | 控制连接静默多久算掉线 |
@@ -176,7 +196,7 @@ agentbus join --codex --bus ws://10.0.0.5:7777/ws --invite inv_xxxxxxxx --name b
 | `agentbus up [-c agentbus.yaml] [-d drivers.yaml] [--build]` | 一个进程起总线和所有托管 agent |
 | `agentbus serve [-c agentbus.yaml]` | 只起总线 |
 | `agentbus install-skill` | 给 Claude Code 和 Codex 装技能 |
-| `agentbus join --claude\|--codex [--name n] [--bus url] [--invite code]` · `agentbus leave … [--purge]` | 目录加入 / 退出 |
+| `agentbus join --claude\|--codex [--name n] [--bus url] [--invite code] [--no-standby] [--standby-autonomy ask]` · `agentbus leave … [--purge]` | 目录加入（默认带 standby）/ 退出 |
 | `agentbus invite --name n --host claude\|codex` | 给另一台机器生成一次性加入命令 |
 | `agentbus whoami` · `inbox` · `wait [--from a] [--timeout s]` · `send --to a\|--room r "…"` · `rooms` · `join-room r` · `leave-room r` | agent 在会话里用 |
 | `agentbus task create\|update\|cancel\|list` | 派活与跟踪 |

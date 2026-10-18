@@ -74,6 +74,14 @@ CREATE TABLE IF NOT EXISTS cursors (
   PRIMARY KEY (agent_name, room)
 );
 
+-- Newest via=standby row the interactive session has been shown, per room (shown once).
+CREATE TABLE IF NOT EXISTS standby_cursors (
+  agent_name   TEXT NOT NULL,
+  room         TEXT NOT NULL,
+  last_seen_id INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (agent_name, room)
+);
+
 CREATE TABLE IF NOT EXISTS deliveries (
   message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
   recipient  TEXT NOT NULL,

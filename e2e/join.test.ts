@@ -126,9 +126,34 @@ describe('agentbus join / leave', () => {
         shell: process.platform === 'win32',
       })
       expect(listed.stdout).toContain('agentbus')
-      // the agent exists on the bus as a relayer, and the adapter can log in with the stored token
+      // the agent exists on the bus as a relayer (online only if the standby driver already came up)
       const status = await run(['status', '--bus', bus(), '--data-dir', join(root, 'data')])
-      expect(status.stdout).toMatch(/proj-frontend\|claude-code\|relayer\|false/)
+      expect(status.stdout).toMatch(/proj-frontend\|claude-code\|relayer\|(true|false)/)
+      // standby is the default: the directory is registered for hosting and `up` was told
+      const standbyFile = join(root, 'agentbus-home', 'agents', 'proj-frontend.standby')
+      expect(existsSync(standbyFile)).toBe(true)
+      expect(JSON.parse(readFileSync(standbyFile, 'utf8'))).toMatchObject({
+        host: 'claude',
+        backend: 'claude-code',
+        cwd: dir,
+        autonomy: 'full',
+        bus: bus(),
+      })
+      expect(r.stdout).toMatch(/standby: (running|starting|failed|registered)/)
+      // --no-standby takes the registration back
+      const off = await run([
+        'join',
+        '--claude',
+        '--dir',
+        dir,
+        '--bus',
+        bus(),
+        '--data-dir',
+        join(root, 'data'),
+        '--no-standby',
+      ])
+      expect(off.stderr).toContain('standby registration removed')
+      expect(existsSync(standbyFile)).toBe(false)
 
       const l = await run(['leave', '--claude', '--dir', dir, '--purge'])
       expect(l.stdout).toContain('left as "proj-frontend"')
@@ -215,6 +240,7 @@ describe('agentbus join / leave', () => {
       // the prompt names the other joined agent: the hook says so, so the model sends instead of answering
       expect(ctx).toContain('addressed to proj-frontend')
       await run(['leave', '--codex', '--dir', join(root, 'proj-frontend')])
+      expect(existsSync(join(root, 'agentbus-home', 'agents', 'proj-frontend.standby'))).toBe(false)
       // the adapter, started the way Codex would start it in that directory, logs in by itself
       const probe = spawn(
         process.execPath,

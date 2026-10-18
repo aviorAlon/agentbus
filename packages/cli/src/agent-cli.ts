@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { BusClient, BusClientError } from '@agentbus/core'
-import type { AgentInfo, Message, Task } from '@agentbus/protocol'
+import type { AgentInfo, InboxResult, Message, Task, WaitResult } from '@agentbus/protocol'
 import {
   encodeRecords,
   MESSAGE_TABLE_FIELDS,
@@ -112,6 +112,20 @@ export function waitTimedOut(timeoutS: number, from?: string): string {
 const INBOX_FOOTER =
   '^ messages TO you from other participants. Answer each yourself with `send --to <from> "..."`; a question about this machine or project is yours to run and report, not to forward.\n'
 
+/**
+ * Rows the standby (the hosted session for this directory) already handled while nobody read
+ * them here. Shown once; the replies are in the room history.
+ */
+const STANDBY_HEADER =
+  '--- already handled by your standby session while you were away (replies are in `history <room>`): just know, do NOT answer again ---\n'
+
+function renderInbox(r: InboxResult, empty: string): string {
+  const parts: string[] = []
+  parts.push(r.messages.length ? table(r.messages) + INBOX_FOOTER : empty)
+  if (r.standby?.length) parts.push(STANDBY_HEADER + table(r.standby))
+  return parts.join('')
+}
+
 export function registerAgentCommands(
   program: Command,
   busOpt: (cmd: Command) => Command,
@@ -147,9 +161,13 @@ export function registerAgentCommands(
       )
       process.stdout.write(
         others.length
-          ? `others: ${others.map((a) => `${a.name}${a.online ? '' : ' (offline)'}${a.capabilities.driver ? ' [hosted]' : ''}`).join(', ')}\n`
+          ? `others: ${others.map((a) => `${a.name}${a.online ? '' : ' (offline)'}${a.capabilities.driver ? ' [hosted]' : a.standby ? ' [standby]' : ''}`).join(', ')}\n`
           : 'no other agents yet\n',
       )
+      if (me?.standby)
+        process.stdout.write(
+          'standby: on (a hosted session answers for you when you do not read within the delay)\n',
+        )
       c.close()
     },
   )
@@ -162,8 +180,8 @@ export function registerAgentCommands(
     const id = agentIdentity(process.cwd(), o.as)
     if (!id) throw notJoined(process.cwd())
     const c = await agentClient(busFor(o.bus, id.name), id)
-    const r = await c.request<{ messages: Message[] }>({ type: 'inbox' })
-    process.stdout.write(r.messages.length ? table(r.messages) + INBOX_FOOTER : 'no new messages\n')
+    const r = await c.request<InboxResult>({ type: 'inbox' })
+    process.stdout.write(renderInbox(r, 'no new messages\n'))
     c.close()
   })
 
@@ -177,7 +195,7 @@ export function registerAgentCommands(
       const id = agentIdentity(process.cwd(), o.as)
       if (!id) throw notJoined(process.cwd())
       const c = await agentClient(busFor(o.bus, id.name), id)
-      const r = await c.request<{ messages: Message[]; timed_out: boolean }>({
+      const r = await c.request<WaitResult>({
         type: 'wait',
         timeout_s: o.timeout,
         ...(o.from ? { from: o.from } : {}),
@@ -185,10 +203,11 @@ export function registerAgentCommands(
       process.stdout.write(
         r.timed_out
           ? waitTimedOut(o.timeout, o.from)
-          : r.messages.length
-            ? table(r.messages) + INBOX_FOOTER
-            : // Only happens when two waits of yours were parked at once: the other one took the row.
+          : renderInbox(
+              r,
+              // Only happens when two waits of yours were parked at once: the other one took the row.
               'nothing for this wait: another wait of yours was running at the same time and received the message — read its output; do not treat this as "no reply".\n',
+            ),
       )
       c.close()
     })

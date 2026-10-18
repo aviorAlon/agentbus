@@ -1,11 +1,11 @@
 import { BusClient, BusClientError } from '@agentbus/core'
-import type { AgentInfo, Message, Role } from '@agentbus/protocol'
+import type { AgentInfo, InboxResult, Message, Role } from '@agentbus/protocol'
 import { encodeRecords } from '@agentbus/protocol'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { httpBaseFromBus } from './files.js'
-import { adapterInstructions, renderMessages } from './render.js'
+import { adapterInstructions, renderInbox, renderMessages } from './render.js'
 import { registerM1Tools } from './tools-m1.js'
 import { registerTaskTools } from './tools-m2.js'
 
@@ -19,6 +19,8 @@ export interface AdapterOptions {
   version?: string
   /** Declare push capability (Claude Code channel). Off by default (F-A12). */
   push?: boolean
+  /** This adapter serves the name's standby driver: `send` / `task_update` act for the standby. */
+  standby?: boolean
   log?: (line: string) => void
 }
 
@@ -56,7 +58,7 @@ export class Adapter {
     this.server = new McpServer(
       { name: 'agentbus', version: opts.version ?? '0.0.0' },
       {
-        instructions: adapterInstructions(opts.name, opts.role),
+        instructions: adapterInstructions(opts.name, opts.role, opts.standby === true),
         // Claude Code channels (research preview): declaring this lets the host accept
         // `notifications/claude/channel` from us. Off unless --push on (F-A12).
         ...(opts.push ? { capabilities: { experimental: { 'claude/channel': {} } } } : {}),
@@ -102,6 +104,7 @@ export class Adapter {
         inbox: true,
         push: this.opts.push ?? false,
         ...(this.opts.push ? { push_preview: true } : {}),
+        ...(this.opts.standby ? { standby: true } : {}),
       },
       ...(this.opts.backend ? { backend: this.opts.backend } : {}),
       ...(this.opts.cwd ? { cwd: this.opts.cwd } : {}),
@@ -310,8 +313,8 @@ export class Adapter {
       },
       async () => {
         try {
-          const r = await c.request<{ messages: Message[] }>({ type: 'inbox' })
-          return text(renderMessages(r.messages))
+          const r = await c.request<InboxResult>({ type: 'inbox' })
+          return text(renderInbox(r))
         } catch (e) {
           return fail(e)
         }

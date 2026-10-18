@@ -10,6 +10,12 @@ export const AgentDriverConfig = z.object({
   token_env: z.string().optional(),
   cwd: z.string(),
   autonomy: z.enum(['full', 'ask']).default('full'),
+  /**
+   * Standby for a directory that is also joined interactively under the same name: the
+   * driver takes only what the person's session leaves unread past the bus's
+   * `standby.delay_s`. The token comes from `~/.agentbus/agents/<name>.token` when present.
+   */
+  standby: z.boolean().default(false),
   batch_window_ms: z.number().int().nonnegative().default(1500),
   turn_timeout_s: z.number().positive().default(600),
   max_attempts: z.number().int().positive().default(3),

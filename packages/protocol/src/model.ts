@@ -17,6 +17,12 @@ export const Capabilities = z.object({
   push: z.boolean().default(false),
   /** push is wired through a research-preview channel (dev flag / allowlist); shown in the console. */
   push_preview: z.boolean().optional(),
+  /**
+   * This connection is the standby for the name: a hosted session that handles what the
+   * interactive session leaves unread past `standby.delay_s`. One standby control (and one
+   * standby tool) per name; it never takes rows a parked `wait` or a timely `inbox` read.
+   */
+  standby: z.boolean().optional(),
 })
 export type Capabilities = z.infer<typeof Capabilities>
 
@@ -55,6 +61,8 @@ export const DeliveryVia = z.enum([
   'mailbox',
   'push->mailbox',
   'push->driver',
+  /** Left unread by the interactive session past `standby.delay_s`; handed to the standby. */
+  'standby',
 ])
 export type DeliveryVia = z.infer<typeof DeliveryVia>
 
@@ -83,6 +91,8 @@ export const AgentInfo = z.object({
   capabilities: Capabilities,
   cwd: z.string().nullable(),
   last_seen: z.number().int().nullable(),
+  /** A standby (hosted) connection is online for this name right now. */
+  standby: z.boolean().optional(),
 })
 export type AgentInfo = z.infer<typeof AgentInfo>
 
