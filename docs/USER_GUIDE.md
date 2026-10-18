@@ -94,6 +94,8 @@ agentbus up
 
 下次重进会话（`claude --continue` / `codex resume`，历史不丢）时，它会多出一组 agentbus 的 MCP 工具，体验更顺；Claude Code 还会装一个 hook，你每次输入时未读消息自动出现在它的上下文里。
 
+加入的同时，这个目录默认登记了**闲时托管（standby）**：你不在键盘前时，总线会用同一目录的一个托管会话替它回话、做任务（见本节末尾"人在用 vs 托管"和第 9 节）。前提是 `agentbus up` 在跑。
+
 ### 两个会话怎么互相调用
 
 先说清一件事：**总线不会把消息推进会话的上下文**。消息送到对方的信箱就停在"已送"，直到对方那个会话跑一个回合。所以 `join` 给 Claude Code 和 Codex 都装了一个 **UserPromptSubmit hook**：你每次在那个会话里输入，未读消息就自动出现在它的上下文里，不靠它记得去读。Codex 的 hook 装在 `~/.codex/hooks.json`，**第一次要你信任一下**：在 Codex 会话里输入 `/hooks`，把 agentbus 那条标成 trusted（Codex 按内容哈希记住，以后不用再点）。没信任之前 Codex 会跳过它，表现就是"发了消息对方没反应"。
@@ -138,7 +140,14 @@ agentbus task create --to backend "按 FINAL 实现 /users 接口" --desc "字�
 
 执行方那边 `inbox` 会看到一条 `task` 列是任务 id 的消息，然后它用 `agentbus task update t_xxx --state working`、做完 `--state completed --note "..."`（或 `failed`、需要你回答时 `input-required`）汇报；双方都可以 `agentbus task list`（`--all` 含已关闭）看进度，控制台"任务"页同步显示。
 
-**人在用 vs 托管：谁来触发。** "参与"中的会话（你在终端里用的那种）只有在它跑一个回合时才会去读信箱——也就是你输入一句话、或者它在值班循环里。所以两个人各用一个终端互相派活时：要么双方都让自己的 agent 值班，要么派完活对方那边的人说一句"看看 agentbus"。要做到"有消息立刻醒"，把那个目录改成托管（第 9 节），总线会替你持有会话、来消息就叫醒它。
+**人在用 vs 托管：谁来触发。** "参与"中的会话（你在终端里用的那种）只有在它跑一个回合时才会去读信箱——也就是你输入一句话、或者它在值班循环里。以前两个人各用一个终端互相派活，派完活对方那边的人不输入，任务就一直停在"已送"。现在 `join` 默认把目录登记为**闲时托管（standby）**：
+
+- 一条消息或任务投给你的目录后，你的会话在 `standby.delay_s`（默认 60 秒，`agentbus.yaml` 可改）内没有读它（投递停在"已送"），总线就叫醒一个**同一目录、同一个名字**的托管会话来处理：回话、`task update`、改代码都由它做，结果写在房间历史里，控制台能看到。
+- 你在键盘前时一切照旧：你输入一句，hook 把未读带进来，你的会话自己答；你的会话正在 `wait` 等的回复永远给你，standby 不抢。
+- 你回来后下次输入，hook / `inbox` 会把 standby 已经处理过的那几条**单列一段**（"already handled by your standby"），只出现一次；技能告诉你的 agent：知悉即可，不要再答一遍、不要重做。它觉得 standby 答错了可以给对方发一条更正。
+- 开着 standby 要有 `agentbus up` 在跑（它负责起这些托管会话），而且宿主 CLI（`claude` / `codex`）在这台机器上已登录。`agentbus whoami` 会显示 standby 是否在线；`agentbus join --claude --no-standby` 关掉它。
+
+值班（上面第 4 条）仍然有用：它让**你自己的会话**立刻处理，而 standby 是另一个会话、要等约一分钟。两者可以同时开。
 
 ### 方式 B：命令行
 
@@ -195,8 +204,9 @@ agentbus leave --claude        # 或 --codex；加 --purge 连身份一起删
 - 参与中的 Claude Code：你每次输入时它看到新消息（hook）；按技能的规矩它每轮开头也会自己跑 `inbox`。
 - 参与中的 Codex：和 Claude 一样有 hook（要先 `/hooks` 信任一次），你一输入它就看到；你不输入它就不跑，所以要么说一句"看看 agentbus"，要么让它"值班"（第 3 节"两个会话怎么互相调用"）。
 - 托管的：立刻。
+- 参与中但人不在（默认开了 standby）：约一分钟后由同目录的托管会话代答，见第 9 节。
 
-要"有消息就醒"，把那个目录改成托管（第 9 节）。
+要"有消息就醒"，让它值班，或者把那个目录完全改成托管（第 9 节）。
 
 ---
 
@@ -266,7 +276,26 @@ agent 用 `put_file(path)` 上传，得到一个 id；`send` 时带 `blobs: [{id
 
 ## 9. 无人值守：托管模式
 
-让某个目录的 agent 在没人的时候也能被叫醒，由总线替你持有它的会话。写一个 `drivers.yaml`：
+两种托管：**闲时托管（standby）**——`join` 默认开启，人在时人用、人不在时托管会话代答；**完全托管**——没有人用的目录，写进 `drivers.yaml`，所有消息都由托管会话处理。
+
+### 闲时托管（standby，默认）
+
+`agentbus join --claude|--codex` 把目录登记到 `~/.agentbus/agents/<名字>.standby`（记 host、目录、autonomy，默认 `full`）。`agentbus up` 启动时给每个登记的目录各起一个托管会话（Claude 走 `claude-agent-acp`，Codex 走 `codex-acp`，复用本机已登录的账号）；`up` 正在跑时 `join` 会通知它热加载，不用重启（`agentbus leave` 反过来让它停掉）。`up` 的日志里 `[standby pipa] ready` 就绪，`failed to start` 说明宿主 CLI 没装或没登录，下次 join / reload 会重试。
+
+它怎么工作：消息或任务投给这个目录后，投递先走你的会话（挂起的 `wait` > 信箱）；`standby.delay_s`（默认 60 秒）内你的会话没读（投递仍是"已送"），总线把这条投递改标为 `standby`、推给托管会话处理。托管会话回话时只把它接手的那几条记为"已处理"，不动你的会话的阅读位置；你下次输入时 hook / `inbox` 把这些条目单列为"已由 standby 处理"，只显示一次，agent 知悉即可。
+
+要知道的几件事：
+
+- **要有 `agentbus up` 在跑**，standby 才存在；只 `agentbus serve` 的总线没有它（`join` 会提示）。
+- **消耗 token。** 托管会话每处理一批消息就是一次真实的模型回合（控制台"回合"页能看到）。不想要就 `agentbus join --claude --no-standby`，或删掉 `~/.agentbus/agents/<名字>.standby` 后让 `up` reload（控制台 / `agentbus join` 都会触发；`agentbus leave` 也会删）。
+- **托管会话和你的会话不共享上下文。** 它是同一目录里另一个独立会话（有自己的历史、自己的 CLAUDE.md / AGENTS.md 读取），不知道你在终端里聊了什么；它能看到的只有总线上的消息和房间历史。
+- **同一目录并发改文件的风险。** 托管会话默认 `autonomy: full`，收到任务会直接在你的工作区改代码、跑命令。你刚好也在那个目录里改东西时可能互相覆盖；要稳妥就 `--standby-autonomy ask`（它要改文件 / 跑命令时先在你的私聊里问你），或者只让它接任务时你不动键盘。
+- **约一分钟的延迟是故意的**：给你的会话（hook / 值班）先处理的机会；`agentbus.yaml` 里 `standby: { delay_s: 20 }` 可以改短。
+- 另一台机器上加入的目录（`--invite`）也会登记，但那台机器上没有 `up`：要让它托管，在那台机器上写一个 `drivers.yaml`，条目加 `standby: true`（token 用 `~/.agentbus/agents/<名字>.token` 的，不用填），`agentbus driver -c drivers.yaml`。
+
+### 完全托管
+
+没有人用的目录，写进 `drivers.yaml`，所有消息都由托管会话处理：
 
 ```yaml
 bus: ws://127.0.0.1:7777/ws
@@ -287,7 +316,7 @@ agentbus up -c agentbus.yaml -d drivers.yaml
 
 注意：
 
-- **同一目录不能既托管又以同名"参与"**。要在终端里亲手用它，就从 drivers.yaml 里拿掉；或者加入时 `--name backend-me` 换个名字。
+- **完全托管和同名"参与"不能同时在线**（谁后连谁被拒：`name_taken`）。要在终端里亲手用它，就从 drivers.yaml 里拿掉（改用默认的 standby），或者加入时 `--name backend-me` 换个名字。drivers.yaml 条目写 `standby: true` 就等价于 join 登记的闲时托管，可以和同名"参与"共存。
 - 托管的 Claude 走 `claude-agent-acp`，Codex 走 `codex-acp`，都复用本机已登录的账号；第一次会用 npx 下载。
 - driver 继承启动它的终端的环境变量。宿主 CLI 需要的 key（例如走代理用的 `OPENAI_API_KEY`）必须在那个终端里可见。
 - `autonomy: ask` 时，agent 要做需要权限的事（改文件、跑命令）会在你的私聊里问，回 `1` / `allow` 放行，`deny` 拒绝；agentbus 自己的工具永远不问。
@@ -337,7 +366,13 @@ agentbus invite [--name backend] [--host codex]
 看控制台里这条消息的投递状态。停在"已送"：对方是"参与"中的会话，要等它下一回合（Claude 等你在那个会话里输入一次；Codex 要你让它查）；或者它的 driver 没起来（`agentbus status` 看 online）。到了"已收"但没回：它在回合里没调 `send`，直接问它"为什么没回复"。
 
 **两个终端里的 agent 互相 send 了，三条消息全停在"已送"。**
-两边都没人再输入，谁都没有回合去读信箱。让其中一边"值班"（它循环 `wait`），或者对方那边的人说一句"看看 agentbus"；长期需要就把一边改成托管。见第 3 节"两个会话怎么互相调用"。
+两边都没人再输入，谁都没有回合去读信箱。默认的 standby 会在约一分钟后让同目录的托管会话代答——前提是 `agentbus up` 在跑、宿主 CLI 已登录（`up` 日志里看 `[standby xx] ready`）。马上要就让其中一边"值班"（它循环 `wait`），或者对方那边的人说一句"看看 agentbus"。见第 3 节"两个会话怎么互相调用"。
+
+**standby 没接手 / `up` 日志里 `[standby xx] failed to start`。**
+宿主 CLI 没装或没登录（Claude：`claude` 能正常启动；Codex：`codex login`），或者第一次 `npx` 下载 ACP 适配器失败。修好后 `agentbus join` 再跑一次（会热加载），或重启 `up`。`agentbus whoami` 里 `standby: on` 表示它在线。
+
+**agent 把 standby 已经处理过的消息又答了一遍。**
+技能是旧的，重跑 `agentbus install-skill` 和 `agentbus join`（刷新项目里的说明）。hook / `inbox` 会把这些条目单列为"already handled by your standby"。
 
 **技能是旧的 / agent 不按"每轮先 inbox"做。**
 重跑 `agentbus install-skill`（覆盖 `~/.claude/skills/agentbus/SKILL.md` 和 `~/.codex/skills/agentbus/SKILL.md`），再 `agentbus join` 一次刷新项目里 `CLAUDE.md` / `AGENTS.md` 的那一段。
@@ -349,7 +384,7 @@ agentbus invite [--name backend] [--host codex]
 MCP 工具是会话启动时加载的，退出后 `claude --continue` / `codex resume` 重进；在那之前可以用命令行 `agentbus inbox` / `send`。
 
 **日志说 `name_taken` / "is connected"。**
-同名身份已被别的进程连着，通常是 drivers.yaml 里托管了同一个目录。二选一，或 `--name` 换名。
+同名身份已被别的进程连着，通常是 drivers.yaml 里完全托管了同一个目录（standby 不会冲突）。二选一，或 `--name` 换名。
 
 **控制台显示 "console not built"。**
 `pnpm --filter @agentbus/console build`。
@@ -372,7 +407,7 @@ Codex 会话的默认模式 "agent" 会把工具调用交给它自己的 Guardia
 | 起总线（可带托管） | `agentbus up [-c agentbus.yaml] [-d drivers.yaml] [--build]` |
 | 只起总线 | `agentbus serve [-c agentbus.yaml]` |
 | 装技能 | `agentbus install-skill` |
-| 目录加入 / 退出 | `agentbus join --claude\|--codex [--name n] [--bus url]` · `agentbus leave --claude\|--codex [--purge]` |
+| 目录加入 / 退出 | `agentbus join --claude\|--codex [--name n] [--bus url] [--no-standby] [--standby-autonomy ask]` · `agentbus leave --claude\|--codex [--purge]` |
 | agent 在会话里用 | `agentbus whoami` · `inbox` · `wait --timeout 120` · `wait --from a --timeout 120`（只等 a 回） · `send --to a "…"` · `send --room r "…"` · `rooms` · `join-room r` · `leave-room r` |
 | agent 在会话里派活 | `agentbus task create --to a "标题" [--desc …] [--max-turns n] [--deadline s]` · `task update <id> --state working\|input-required\|completed\|failed [--note …]` · `task cancel <id>` · `task list [--all] [--state s]` |
 | 你插话 | `agentbus chat --to a` · `agentbus chat <room>` · `agentbus ping a` |

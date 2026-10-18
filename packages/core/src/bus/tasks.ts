@@ -3,6 +3,7 @@ import type { BlobRef, Message, Task, TaskEventPayload, TaskState } from '@agent
 import { canTransition, dmRoom, TERMINAL_TASK_STATES } from '@agentbus/protocol'
 import type { BusConfig } from '../config.js'
 import type { Store } from '../store/store.js'
+import type { Actor } from './bus.js'
 import { BusError } from './errors.js'
 
 /** What the task service needs from the bus; keeps this module testable in isolation. */
@@ -13,7 +14,7 @@ export interface TaskHost {
   /** Resolve `{id,name}` references into full refs; throws bad_request for unknown blobs. */
   resolveBlobs(refs: { id: string; name: string }[] | undefined): BlobRef[]
   /** Post a message into a room on behalf of an actor (guard-exempt when task_id is set). */
-  post(from: string, room: string, text: string, payload: TaskEventPayload, taskId: string): Message
+  post(from: Actor, room: string, text: string, payload: TaskEventPayload, taskId: string): Message
   /** Humans with authority who can be escalated to: in the room first, then anywhere. */
   humansFor(room: string): string[]
   ensureDmRoom(a: string, b: string): string
@@ -34,7 +35,7 @@ export class TaskService {
   constructor(private readonly h: TaskHost) {}
 
   create(
-    from: string,
+    actor: Actor,
     req: {
       to: string
       description: string
@@ -45,6 +46,7 @@ export class TaskService {
       max_turns?: number | null | undefined
     },
   ): Task {
+    const from = actor.name
     if (req.to === from) throw new BusError('bad_request', 'cannot assign a task to yourself')
     if (!this.h.store.getAgent(req.to)) throw new BusError('unknown_agent', `no agent ${req.to}`)
     const room = req.room ?? this.h.ensureDmRoom(from, req.to)
@@ -73,13 +75,13 @@ export class TaskService {
       `budget: ${task.max_turns ?? '∞'} bot messages, deadline ${task.deadline ? new Date(task.deadline).toISOString() : 'none'}. ` +
         `Executor: report with task_update(state=working|input-required|completed|failed).`,
     ].filter(Boolean)
-    this.postWithBlobs(from, room, lines.join('\n'), task, null, blobs)
+    this.postWithBlobs(actor, room, lines.join('\n'), task, null, blobs)
     this.h.emitTask(task)
     return task
   }
 
   update(
-    by: string,
+    actor: Actor,
     req: {
       task_id: string
       state: 'working' | 'input-required' | 'completed' | 'failed'
@@ -88,6 +90,7 @@ export class TaskService {
       escalate?: boolean | undefined
     },
   ): Task {
+    const by = actor.name
     const task = this.require(req.task_id)
     const authority = this.h.authorityOf(by)
     if (by !== task.to && authority !== 'human')
@@ -111,13 +114,14 @@ export class TaskService {
       },
     )
     const text = `[task ${task.id}] ${task.state} → ${req.state}${req.summary ? `: ${req.summary}` : ''}`
-    this.postWithBlobs(by, task.room, text, updated, task.state, blobs, escalateNow)
+    this.postWithBlobs(actor, task.room, text, updated, task.state, blobs, escalateNow)
     if (escalateNow) this.escalate(updated, req.summary ?? null)
     this.h.emitTask(updated)
     return updated
   }
 
-  cancel(by: string, taskId: string, reason?: string): Task {
+  cancel(actor: Actor, taskId: string, reason?: string): Task {
+    const by = actor.name
     const task = this.require(taskId)
     const authority = this.h.authorityOf(by)
     if (by !== task.from && authority !== 'human')
@@ -128,7 +132,7 @@ export class TaskService {
     this.assertTransition(task, 'canceled')
     const updated = this.h.store.transitionTask(task.id, 'canceled', by, reason ?? null, [])
     this.h.post(
-      by,
+      actor,
       task.room,
       `[task ${task.id}] ${task.state} → canceled${reason ? `: ${reason}` : ''}`,
       {
@@ -186,7 +190,7 @@ export class TaskService {
   private failBudget(task: Task, reason: string): Task {
     const updated = this.h.store.transitionTask(task.id, 'failed', 'bus', `budget: ${reason}`, [])
     this.h.post(
-      'bus',
+      { name: 'bus' },
       task.room,
       `[task ${task.id}] ${task.state} → failed (budget: ${reason}). ${task.from} and ${task.to}: stop; a human may open a new task.`,
       {
@@ -211,7 +215,7 @@ export class TaskService {
     if (!target) return
     const dm = this.h.ensureDmRoom(task.to, target)
     this.h.post(
-      task.to,
+      { name: task.to },
       dm,
       `[task ${task.id}] needs input and its dispatcher ${task.from} is a bot. ${summary ?? task.description}\nReply in room ${task.room} (or here) to unblock.`,
       {
@@ -226,7 +230,7 @@ export class TaskService {
   }
 
   private postWithBlobs(
-    from: string,
+    from: Actor,
     room: string,
     text: string,
     task: Task,

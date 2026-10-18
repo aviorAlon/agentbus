@@ -1,5 +1,13 @@
 import { type ExecFileSyncOptionsWithStringEncoding, execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,6 +44,10 @@ export interface JoinRequest {
   noHook?: boolean
   /** Skip the CLAUDE.md / AGENTS.md note. */
   noNote?: boolean
+  /** Do not register the directory for standby hosting (`--no-standby`). */
+  noStandby?: boolean
+  /** Standby autonomy for permission requests; default full. */
+  standbyAutonomy?: 'full' | 'ask'
 }
 
 export interface JoinResult {
@@ -44,9 +56,70 @@ export interface JoinResult {
   host: Host
   authority: 'bot' | 'relayer'
   tokenFile: string
+  /** The standby registration written (or null with --no-standby). */
+  standbyFile: string | null
   steps: string[]
   /** What the user has to do now. */
   next: string
+}
+
+/**
+ * Standby registration for a joined directory: `~/.agentbus/agents/<name>.standby`, JSON.
+ * `agentbus up` on the bus machine starts one standby driver per file whose `bus` is this
+ * bus; `agentbus join` asks a running `up` to reload them. The shape is a drivers.yaml entry
+ * without `name` / `token` (the token is the directory's own token file).
+ */
+export interface StandbyFile {
+  host: Host
+  backend: string
+  cwd: string
+  autonomy: 'full' | 'ask'
+  bus: string
+  /** Optional ACP launch override (tests, custom adapters), same as drivers.yaml `acp:`. */
+  acp?: { command: string; args?: string[]; env?: Record<string, string>; mode?: string }
+  batch_window_ms?: number
+  turn_timeout_s?: number
+  joined_at: number
+}
+
+export function standbyFileFor(name: string): string {
+  return join(agentbusHome(), 'agents', `${name}.standby`)
+}
+
+export function readStandbyFile(name: string): StandbyFile | null {
+  const f = standbyFileFor(name)
+  if (!existsSync(f)) return null
+  try {
+    return JSON.parse(readFileSync(f, 'utf8')) as StandbyFile
+  } catch {
+    return null
+  }
+}
+
+/** Every standby registration in `home` (default: this machine's agentbus home), by name. */
+export function listStandbyFiles(home = agentbusHome()): { name: string; entry: StandbyFile }[] {
+  const dir = join(home, 'agents')
+  if (!existsSync(dir)) return []
+  const out: { name: string; entry: StandbyFile }[] = []
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.standby')) continue
+    try {
+      out.push({
+        name: f.slice(0, -'.standby'.length),
+        entry: JSON.parse(readFileSync(join(dir, f), 'utf8')) as StandbyFile,
+      })
+    } catch {
+      // unreadable registration: skipped, reported by `up`
+    }
+  }
+  return out
+}
+
+export function removeStandbyFile(name: string): boolean {
+  const f = standbyFileFor(name)
+  if (!existsSync(f)) return false
+  unlinkSync(f)
+  return true
 }
 
 export function agentbusHome(): string {
@@ -170,6 +243,29 @@ export async function joinHost(req: JoinRequest): Promise<JoinResult> {
   steps.push(`token for "${name}" stored in ${tokenFile}`)
   const bin = cliBin()
 
+  // Standby is the default: while nobody reads this directory's session, a hosted one answers.
+  let standbyFile: string | null = null
+  if (req.noStandby) {
+    if (removeStandbyFile(name)) steps.push('standby registration removed (--no-standby)')
+  } else {
+    standbyFile = standbyFileFor(name)
+    const entry: StandbyFile = {
+      host: req.host,
+      backend,
+      cwd: dir,
+      autonomy: req.standbyAutonomy ?? 'full',
+      bus: req.bus,
+      joined_at: Date.now(),
+    }
+    writeFileSync(standbyFile, `${JSON.stringify(entry, null, 2)}\n`, 'utf8')
+    steps.push(
+      `standby registered in ${standbyFile} (a hosted ${backend} session answers for "${name}" when this one does not read in time)`,
+    )
+  }
+  const standbyNote = standbyFile
+    ? ` Standby: "agentbus up" must be running on this machine and ${req.host} logged in; it starts a hosted ${backend} session for this directory that answers when nobody reads here within standby.delay_s (default 60 s). Turn it off with "agentbus join --${req.host} --no-standby".`
+    : ''
+
   const noteFile = join(dir, req.host === 'claude' ? 'CLAUDE.md' : 'AGENTS.md')
   if (!req.noNote) {
     addProjectNote(noteFile, projectNote(name, req.bus, launcherFor(bin)))
@@ -215,8 +311,9 @@ export async function joinHost(req: JoinRequest): Promise<JoinResult> {
       host: req.host,
       authority: req.authority ?? 'relayer',
       tokenFile,
+      standbyFile,
       steps,
-      next: `In ${dir}: leave the running Claude Code session and come back with "claude --continue" (history is kept). Then tell it: 看看 agentbus 有没有人找我.`,
+      next: `In ${dir}: leave the running Claude Code session and come back with "claude --continue" (history is kept). Then tell it: 看看 agentbus 有没有人找我.${standbyNote}`,
     }
   }
 
@@ -253,8 +350,9 @@ export async function joinHost(req: JoinRequest): Promise<JoinResult> {
     host: req.host,
     authority: req.authority ?? 'relayer',
     tokenFile,
+    standbyFile,
     steps,
-    next,
+    next: next + standbyNote,
   }
 }
 
@@ -290,6 +388,8 @@ export function leaveHost(req: LeaveRequest): { name: string; steps: string[] } 
   }
   for (const f of [join(dir, 'CLAUDE.md'), join(dir, 'AGENTS.md')])
     if (removeProjectNote(f)) steps.push(`note removed from ${f}`)
+  if (removeStandbyFile(name))
+    steps.push('standby registration removed (a running "agentbus up" stops it on its next reload)')
   if (req.purge) {
     for (const f of [tokenFileFor(name), busFileFor(name)])
       if (existsSync(f)) {

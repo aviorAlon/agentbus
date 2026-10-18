@@ -11,6 +11,7 @@ Status: all planned milestones (M0–M4) are implemented with automated tests. T
 Two coding agents working on the same product usually cannot reach each other. The person in the middle copies questions and answers between terminals. agentbus gives every agent a mailbox, a name and a token, and gives the person a console:
 
 - **Sessions you are already using** join with one sentence ("join agentbus"). No restart, no MCP wiring by hand.
+- **While you are away, a standby answers.** A joined directory also gets a hosted session of its own that takes whatever your session leaves unread for a minute, so a task handed to you does not wait for your next keystroke.
 - **Unattended agents** are hosted by the bus: it holds the session and wakes it on every message.
 - **Tasks** are a state machine the bus enforces (submitted → working → completed / failed, budgets, deadlines), not a convention.
 - **Humans** see every message, every delivery state and every task, and can pause a room, cancel a task or answer in person.
@@ -19,6 +20,7 @@ Two coding agents working on the same product usually cannot reach each other. T
 
 - Direct messages and rooms, with a three-state delivery record per recipient (sent / seen / handled).
 - Interactive sessions read their inbox at every turn through a `UserPromptSubmit` hook; `wait` parks until a reply arrives, optionally from one named sender (`wait --from`).
+- Standby: a joined directory is also hosted; rows its session leaves unread past `standby.delay_s` are handed to that hosted session (delivery path `standby`), and shown to the person once, flagged, afterwards.
 - Hosted agents through the Agent Client Protocol (`claude-agent-acp`, `codex-acp`, any ACP adapter), an OpenAI-compatible API backend, or a per-turn CLI fallback.
 - Tasks with budgets (`max_turns`, `deadline`), `input-required` escalation to a person, an append-only event log and a console board.
 - File transfer through content-addressed blobs with quotas.
@@ -72,6 +74,8 @@ Build the console once if you want the web UI: `pnpm --filter @agentbus/console 
 
    `join` mints a token into `~/.agentbus/agents/<name>.token`, registers the MCP tools for the next session (`claude --continue` / `codex resume`), installs a `UserPromptSubmit` hook so unread messages appear in the context every time you type, and appends a short "you are on the bus" note to the project's `CLAUDE.md` / `AGENTS.md`. Codex runs a new hook only after you trust it once: type `/hooks` in the session and trust the agentbus entry.
 
+   It also registers the directory for **standby** (`~/.agentbus/agents/<name>.standby`): the running `agentbus up` starts a hosted session of the same directory, which answers and executes tasks whenever your session has not read a message within a minute. Needs `agentbus up` running and the host CLI logged in; `--no-standby` turns it off. See "Hosted agents" below.
+
 4. Talk. In the frontend session: "ask backend when the /users endpoint will be ready". In the backend session, type anything and the question is in its context; it answers through the bus.
 
 Leave with `agentbus leave --claude` (add `--purge` to delete the identity too).
@@ -86,10 +90,27 @@ The bus never pushes into a session's context. A message waits in the recipient'
 - **A question and a piece of work wait differently.** A question waits for the answer. Work goes through `task create` and waits only for the first `working` update, then the turn ends; the completion report comes back through the hook later. Long waits (`--timeout 1800`) only when the user says so.
 - **A timed-out wait is not a failure.** The CLI prints, and the agent repeats, that the message is in the other side's mailbox and the reply will come back automatically.
 - **On duty**: say "on duty" / 值班 and the session loops on `wait --timeout 300`, handling and answering every message until you stop it.
+- **Standby rows are information.** What the standby already handled while you were away shows up once, in its own block ("already handled by your standby"); the agent acknowledges it and does not answer again.
 
 See the (Chinese) [user guide §3](docs/USER_GUIDE.md) for the full rules, and `node e2e/live-dialog.mjs cpu|crossed` to watch two real Codex sessions do it (costs tokens).
 
 ## Hosted agents (unattended)
+
+Two flavours. **Standby** (on by default for every joined directory): the person uses the directory interactively, and a hosted session of the same directory takes over only what the person leaves unread. **Fully hosted**: nobody uses the directory; every message goes to the hosted session.
+
+### Standby (default for joined directories)
+
+`agentbus join` writes `~/.agentbus/agents/<name>.standby` (host, directory, autonomy). `agentbus up` starts one standby driver per registration at startup (Claude through `claude-agent-acp`, Codex through `codex-acp`, both on the account logged in on that machine) and hot-loads new ones when `join` asks (`POST /api/console/standby/reload`, human token); `agentbus leave` removes the registration. Delivery goes to your session first (a parked `wait`, then the mailbox); a row still unread after `standby.delay_s` (default 60 s) is relabelled `standby` and pushed to the hosted session, which replies or runs the task as you. Its sends mark only those rows handled and leave your cursor alone, so your next `inbox` / hook shows them once, flagged, and the skill tells the model not to answer them again.
+
+Things to know:
+
+- It costs tokens: every batch the standby handles is a real model turn (the console's "turns" page lists them). `agentbus join --claude --no-standby` turns it off for a directory.
+- The standby and your session share no context: it is a second session in the same directory, with its own history; it sees the bus and the room history, not your terminal.
+- It edits the same working tree. With the default `autonomy: full` a task it receives changes files and runs commands in your directory while you may be working there. `--standby-autonomy ask` makes it ask in your dm before each permission.
+- The minute of delay is deliberate (your hook or on-duty loop gets the first chance); `standby.delay_s` in `agentbus.yaml` shortens it.
+- A directory joined from another machine (`--invite`) has no `up` there: put it in a `drivers.yaml` entry with `standby: true` on that machine (the token is read from `~/.agentbus/agents/<name>.token`) and run `agentbus driver -c drivers.yaml`.
+
+### Fully hosted
 
 Let the bus hold a session so the agent wakes on every message even when nobody is at the keyboard. Write `drivers.yaml`:
 
@@ -114,7 +135,7 @@ agentbus ping backend
 
 Notes:
 
-- A directory cannot be hosted and joined interactively under the same name at once. Remove it from `drivers.yaml`, or join with `--name backend-me`.
+- A fully hosted directory and an interactive session cannot be online under the same name at once (`name_taken`). Remove it from `drivers.yaml` and rely on standby, or join with `--name backend-me`. A `drivers.yaml` entry with `standby: true` is the same thing `join` registers and coexists with the interactive session.
 - The driver inherits the environment of the terminal that started it. API keys the host CLI needs (for example `OPENAI_API_KEY` for a proxy) must be visible there.
 - `autonomy: ask`: the agent's permission requests (edit a file, run a command) arrive in your dm; reply `1` / `allow` or `deny`. Requests time out after `permission_timeout_s` (default 600) and count as denied.
 - The driver switches the ACP session mode by `autonomy` (Codex: `agent-full-access` / `workspace-write`; Claude: `bypassPermissions` / `default`). Set `acp.mode` to choose another.
@@ -164,6 +185,7 @@ The bus's `agentbus.yaml` needs `bind: 0.0.0.0` (and optionally `public_host` fo
 | `guard.cap` / `guard.min_interval_ms` | `20` / `2000` | consecutive bot messages before a room pauses; minimum gap per agent |
 | `mailbox.ttl_hours` / `mailbox.max_per_agent` | `24` / `1000` | offline mailbox expiry and cap (oldest dropped, sender notified) |
 | `push.seen_timeout_s` | `10` | push delivery falls back to the mailbox after this |
+| `standby.delay_s` | `60` | a row the interactive session has not read by then goes to the directory's standby session |
 | `message.max_text_bytes` | `65536` | message size limit |
 | `task.deadline_s` / `task.max_turns` | `3600` / `30` | task budget defaults |
 | `heartbeat_timeout_ms` | `30000` | a silent control connection is considered dead after this |
@@ -176,7 +198,7 @@ The bus's `agentbus.yaml` needs `bind: 0.0.0.0` (and optionally `public_host` fo
 | `agentbus up [-c agentbus.yaml] [-d drivers.yaml] [--build]` | bus plus every hosted agent in one process |
 | `agentbus serve [-c agentbus.yaml]` | bus only |
 | `agentbus install-skill` | write the skill for Claude Code and Codex |
-| `agentbus join --claude\|--codex [--name n] [--bus url] [--invite code]` · `agentbus leave … [--purge]` | put a directory on the bus / take it off |
+| `agentbus join --claude\|--codex [--name n] [--bus url] [--invite code] [--no-standby] [--standby-autonomy ask]` · `agentbus leave … [--purge]` | put a directory on the bus (standby on by default) / take it off |
 | `agentbus invite --name n --host claude\|codex` | one-time join command for another machine |
 | `agentbus whoami` · `inbox` · `wait [--from a] [--timeout s]` · `send --to a\|--room r "…"` · `rooms` · `join-room r` · `leave-room r` | the agent's own commands inside a session |
 | `agentbus task create\|update\|cancel\|list` | hand out and track work |

@@ -20,6 +20,8 @@ export const BusConfig = z.object({
     })
     .default({}),
   push: z.object({ seen_timeout_s: z.number().positive().default(10) }).default({}),
+  /** Rows the interactive session has not read within `delay_s` go to the name's standby connection. */
+  standby: z.object({ delay_s: z.number().positive().default(60) }).default({}),
   blobs: z
     .object({
       max_bytes: z

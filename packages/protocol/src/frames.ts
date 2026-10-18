@@ -233,4 +233,11 @@ export type RegisterResult = {
   took_over: boolean
 }
 export type SendResult = { message: Message; deliveries: Delivery[] }
-export type InboxResult = { messages: Message[] }
+/**
+ * `messages`: unread rows for this session. `standby`: rows the name's standby connection
+ * took over (via=standby) that this interactive session has not been shown yet — for
+ * information only, each shown once; the standby's replies are in the room history.
+ * A standby session's own inbox returns only its rows and leaves `standby` empty.
+ */
+export type InboxResult = { messages: Message[]; standby: Message[] }
+export type WaitResult = InboxResult & { timed_out: boolean }

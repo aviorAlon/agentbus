@@ -437,6 +437,11 @@ function AgentRow({ a, onChat }: { a: AgentInfo; onChat?: () => void }) {
           {t('badge.relayer')}
         </span>
       )}
+      {a.standby && (
+        <span className="badge" title={t('badge.standby.tip')}>
+          {t('badge.standby')}
+        </span>
+      )}
       {a.authority === 'human' && <span className="badge human">{t('badge.human')}</span>}
       {a.capabilities.push && <span className="badge preview">{t('badge.push')}</span>}
       {onChat && (

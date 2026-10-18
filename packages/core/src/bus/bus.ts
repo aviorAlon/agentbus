@@ -5,6 +5,7 @@ import type {
   ClientFrame,
   Delivery,
   DeliveryVia,
+  InboxResult,
   Message,
   ResponseFrame,
   SendResult,
@@ -12,6 +13,7 @@ import type {
   SystemKind,
   Task,
   TaskEventPayload,
+  WaitResult,
 } from '@agentbus/protocol'
 import { dmParties, dmRoom, isDmRoom, isValidRoom, parseClientFrame } from '@agentbus/protocol'
 import type { BusConfig } from '../config.js'
@@ -21,9 +23,14 @@ import { Guard } from './guard.js'
 import { type Connection, Registry, type Session } from './registry.js'
 import { TaskService } from './tasks.js'
 
-/** Whoever is acting: a WS session, or an HTTP participant identified by token. */
+/**
+ * Whoever is acting: a WS session, or an HTTP participant identified by token. A standby
+ * actor speaks for the name while the person is away: its sends mark only the rows it was
+ * handed as handled and never move the interactive session's cursor.
+ */
 export interface Actor {
   name: string
+  standby?: boolean
 }
 export type SendInput = Omit<Extract<ClientFrame, { type: 'send' }>, 'id' | 'type'>
 
@@ -34,6 +41,8 @@ export interface BusEvents {
   task: [Task]
   /** Agent list changed (register / disconnect / status). */
   presence: []
+  /** A row the interactive session left unread was handed to the standby. */
+  standby: [{ message: Message; recipient: string }]
 }
 
 /**
@@ -98,8 +107,12 @@ export class Bus extends EventEmitter<BusEvents> {
   private dispatch(conn: Connection, f: ClientFrame): unknown {
     if (f.type === 'register') {
       const res = this.registry.register(conn, f)
-      // Flush whatever is waiting for this agent (mailbox) to a fresh control connection.
-      if (f.role === 'control') this.flushPending(f.name)
+      // Flush whatever is waiting for this agent (mailbox) to a fresh control connection;
+      // a fresh standby takes what is already overdue and starts the clock on the rest.
+      if (f.role === 'control') {
+        if (f.capabilities.standby) this.flushStandby(f.name)
+        else this.flushPending(f.name)
+      }
       this.emit('presence')
       return res
     }
@@ -122,7 +135,9 @@ export class Bus extends EventEmitter<BusEvents> {
       case 'send':
         return this.send(s, f)
       case 'inbox':
-        return { messages: this.inbox(s.name, f.peek === true) }
+        return s.standby
+          ? ({ messages: this.standbyInbox(s.name), standby: [] } satisfies InboxResult)
+          : this.inboxFull(s.name, f.peek === true)
       case 'ack':
         return { deliveries: this.ack(s.name, f.message_ids) }
       case 'status':
@@ -130,11 +145,11 @@ export class Bus extends EventEmitter<BusEvents> {
       case 'wait':
         return this.wait(s, f.id, f.timeout_s, f.from)
       case 'task_create':
-        return { task: this.tasks.create(s.name, f) }
+        return { task: this.tasks.create(s, f) }
       case 'task_update':
-        return { task: this.tasks.update(s.name, f) }
+        return { task: this.tasks.update(s, f) }
       case 'task_cancel':
-        return { task: this.tasks.cancel(s.name, f.task_id, f.reason) }
+        return { task: this.tasks.cancel(s, f.task_id, f.reason) }
       case 'tasks':
         return {
           tasks: this.store.listTasks({
@@ -175,7 +190,12 @@ export class Bus extends EventEmitter<BusEvents> {
     const now = this.now()
     return this.store.listAgents().map((a) => {
       const online = this.registry.isOnline(a.name)
-      return { ...this.store.agentInfo(a), online, state: this.store.presence(a, online, now) }
+      return {
+        ...this.store.agentInfo(a),
+        online,
+        state: this.store.presence(a, online, now),
+        standby: this.registry.standby(a.name) !== null,
+      }
     })
   }
 
@@ -312,9 +332,7 @@ export class Bus extends EventEmitter<BusEvents> {
         ...(blobs.length ? { blobs } : {}),
       })
       // Sending is activity: the sender has handled everything it received in this room so far.
-      this.markRoomSeen(s.name, room, message.id)
-      this.store.markHandledUpTo(s.name, room, message.id)
-      this.store.touchActivity(s.name)
+      this.markSentHandled(s, room, message.id)
       const deliveries = this.deliver(message)
       return { message, deliveries }
     })
@@ -334,12 +352,26 @@ export class Bus extends EventEmitter<BusEvents> {
     return result
   }
 
+  /**
+   * What a send implies for the sender's own deliveries in that room: what it had read (or had
+   * pushed into its context) there is handled. The read cursor does not move, so a reply that
+   * arrived while the sender was busy is still unread afterwards. The standby only answers for
+   * the rows it pulled and never touches the person's rows or cursor.
+   */
+  private markSentHandled(s: Actor, room: string, upTo: number): void {
+    if (s.standby) this.store.markStandbyHandledUpTo(s.name, room, upTo)
+    else this.store.markHandledUpTo(s.name, room, upTo)
+    this.store.touchActivity(s.name)
+  }
+
   // ------------------------------------------------------------- delivery
 
   /**
-   * Write one delivery per recipient and pick the path (§4.2):
-   * driver / push (event to the live control connection), wait (resolve the
-   * parked request, counts as seen), or mailbox (written only).
+   * Write one delivery per recipient and pick the path (§4.2) from what the recipient's
+   * newest interactive connection declared: driver / push (event to the live control
+   * connections), wait (resolve the parked request, counts as seen), or mailbox (written
+   * only). A row that waits on the person (mailbox or push) also starts the standby clock
+   * when a standby is connected for the name.
    */
   private deliver(message: Message): Delivery[] {
     const out: Delivery[] = []
@@ -347,7 +379,7 @@ export class Bus extends EventEmitter<BusEvents> {
       if (recipient === message.from) continue
       const agent = this.store.getAgent(recipient)
       if (!agent) continue
-      const ctls = this.registry.controls(recipient)
+      const ctls = this.registry.interactive(recipient)
       const ctl = ctls[ctls.length - 1] ?? null
       // A wait narrowed to one sender ignores everyone else: their rows go the normal way.
       const waiting = ctls.filter(
@@ -357,8 +389,8 @@ export class Bus extends EventEmitter<BusEvents> {
       // A parked wait is the recipient asking for exactly this; honour it first.
       let via: DeliveryVia = 'mailbox'
       if (waiting.length) via = 'wait'
-      else if (ctl && agent.capabilities.driver) via = 'driver'
-      else if (ctl && agent.capabilities.push) via = 'push'
+      else if (ctl?.capabilities.driver) via = 'driver'
+      else if (ctl?.capabilities.push) via = 'push'
 
       const d = this.store.insertDelivery(message.id, recipient, via)
       if (via === 'mailbox') {
@@ -375,10 +407,77 @@ export class Bus extends EventEmitter<BusEvents> {
         if (via === 'driver' || via === 'push')
           for (const c of ctls) c.conn.send({ type: 'event', event: 'message', message })
         if (via === 'push') this.armPushDegrade(message.id, recipient)
+        if (via === 'mailbox' || via === 'push') this.armStandby(message.id, recipient)
         out.push(d)
       }
     }
     return out
+  }
+
+  // -------------------------------------------------------------- standby
+
+  /**
+   * The person's session has `standby.delay_s` to read a row; after that a connected standby
+   * takes it. The timer is the prompt path; `tick()` sweeps the same condition so nothing is
+   * lost across a bus restart or a standby that connects later.
+   */
+  private armStandby(messageId: number, recipient: string, delayMs?: number): void {
+    if (!this.registry.standby(recipient)) return
+    const timer = setTimeout(
+      () => this.handToStandby(messageId, recipient),
+      delayMs ?? this.config.standby.delay_s * 1000,
+    )
+    if (typeof timer === 'object' && 'unref' in timer) timer.unref()
+  }
+
+  /** Relabel one unread interactive row as the standby's and push it to the standby connection. */
+  private handToStandby(messageId: number, recipient: string): boolean {
+    const d = this.store.getDelivery(messageId, recipient)
+    if (!d || d.seen_at !== null || d.error !== null) return false
+    if (d.via !== 'mailbox' && d.via !== 'push' && d.via !== 'push->mailbox') return false
+    const sb = this.registry.standby(recipient)
+    if (!sb) return false
+    const message = this.store.getMessage(messageId)
+    if (!message) return false
+    this.store.setDeliveryVia(messageId, recipient, 'standby')
+    this.store.appendEvent(
+      'standby',
+      { message_id: messageId, recipient, from: d.via },
+      recipient,
+      message.room,
+    )
+    sb.conn.send({ type: 'event', event: 'message', message })
+    const updated = this.store.getDelivery(messageId, recipient)
+    if (updated) this.emit('delivery', updated)
+    this.emit('standby', { message, recipient })
+    return true
+  }
+
+  /** Hand every overdue interactive row of `name` to its standby; returns how many moved. */
+  private standbySweep(name: string): number {
+    const cutoff = this.now() - this.config.standby.delay_s * 1000
+    let n = 0
+    for (const d of this.store.pendingInteractive(name))
+      if (d.written_at <= cutoff && this.handToStandby(d.message_id, name)) n++
+    return n
+  }
+
+  /** A standby just connected: take what is overdue now, time the rest. */
+  private flushStandby(name: string): void {
+    const delayMs = this.config.standby.delay_s * 1000
+    const now = this.now()
+    for (const d of this.store.pendingInteractive(name)) {
+      const due = d.written_at + delayMs - now
+      if (due <= 0) this.handToStandby(d.message_id, name)
+      else this.armStandby(d.message_id, name, due)
+    }
+  }
+
+  /** The standby's inbox: only rows handed to it, marked seen one by one; the person's cursor is untouched. */
+  standbyInbox(name: string): Message[] {
+    const rows = this.store.pendingStandby(name)
+    for (const m of rows) this.store.markSeen(m.id, name)
+    return rows
   }
 
   /**
@@ -398,16 +497,14 @@ export class Bus extends EventEmitter<BusEvents> {
     if (typeof timer === 'object' && 'unref' in timer) timer.unref()
   }
 
-  /** On (re)connect of a control session: hand over everything still unseen. */
+  /** On (re)connect of an interactive control session: hand over everything still unseen. */
   private flushPending(name: string): void {
     const ctl = this.registry.control(name)
     if (!ctl) return
-    const agent = this.store.getAgent(name)
-    if (!agent) return
     const pending = this.store.pendingFor(name)
     if (!pending.length) return
-    if (agent.capabilities.driver || agent.capabilities.push) {
-      const via: DeliveryVia = agent.capabilities.driver ? 'driver' : 'push'
+    if (ctl.capabilities.driver || ctl.capabilities.push) {
+      const via: DeliveryVia = ctl.capabilities.driver ? 'driver' : 'push'
       for (const m of pending) {
         this.store.setDeliveryVia(m.id, name, via)
         ctl.conn.send({ type: 'event', event: 'message', message: m })
@@ -418,17 +515,34 @@ export class Bus extends EventEmitter<BusEvents> {
 
   /** `inbox()`: unread across all rooms, oldest first; advances cursors (= seen) unless peeking. */
   inbox(name: string, peek = false): Message[] {
-    const out: Message[] = []
+    return this.inboxFull(name, peek).messages
+  }
+
+  /**
+   * The interactive session's full look: unread rows, plus the rows its standby took over
+   * that it has not been shown yet. Those are shown exactly once (their own cursor moves
+   * even on a peek, since a hook is the usual reader) and are never counted as unread.
+   */
+  inboxFull(name: string, peek = false): InboxResult {
+    const messages: Message[] = []
+    const standby: Message[] = []
     for (const room of this.store.roomsOf(name)) {
       const after = this.store.getCursor(name, room)
       const msgs = this.store.unreadFor(name, room, after, 500)
       // Advance past everything (including own / dropped messages) up to the newest in the room.
       const newest = this.store.history(room, 1)[0]
       if (!peek && newest && newest.id > after) this.markRoomSeen(name, room, newest.id)
-      for (const m of msgs) out.push(m)
+      for (const m of msgs) messages.push(m)
+      const shown = Math.max(after, this.store.getStandbyCursor(name, room))
+      const taken = this.store.standbyRowsFor(name, room, shown, 500)
+      if (taken.length) {
+        this.store.advanceStandbyCursor(name, room, (taken[taken.length - 1] as Message).id)
+        for (const m of taken) standby.push(m)
+      }
     }
-    out.sort((a, b) => a.id - b.id)
-    return out
+    messages.sort((a, b) => a.id - b.id)
+    standby.sort((a, b) => a.id - b.id)
+    return { messages, standby }
   }
 
   private markRoomSeen(name: string, room: string, upTo: number): void {
@@ -492,27 +606,23 @@ export class Bus extends EventEmitter<BusEvents> {
    * own budget) and the rate limit, but is delivered and recorded like any other message.
    */
   private post(
-    from: string,
+    from: Actor,
     room: string,
     text: string,
     payload: TaskEventPayload,
     taskId: string,
   ): Message {
-    const authority = from === 'bus' ? 'bot' : this.authorityOf(from)
+    const authority = from.name === 'bus' ? 'bot' : this.authorityOf(from.name)
     const result = this.store.transaction(() => {
       const message = this.store.insertMessage({
         room,
-        from,
+        from: from.name,
         authority,
         text,
         payload,
         task_id: taskId,
       })
-      if (from !== 'bus') {
-        this.markRoomSeen(from, room, message.id)
-        this.store.markHandledUpTo(from, room, message.id)
-        this.store.touchActivity(from)
-      }
+      if (from.name !== 'bus') this.markSentHandled(from, room, message.id)
       const deliveries = this.deliver(message)
       return { message, deliveries }
     })
@@ -534,11 +644,15 @@ export class Bus extends EventEmitter<BusEvents> {
    * request until a delivery arrives or the timeout elapses (§4.1 inbox/wait).
    */
   private wait(s: Session, requestId: string, timeoutS: number, from?: string): unknown {
-    if (s.role !== 'control')
-      throw new BusError('bad_request', 'only the control connection can wait')
+    if (s.role !== 'control' || s.standby)
+      throw new BusError('bad_request', 'only an interactive control connection can wait')
     if (s.waiting) throw new BusError('bad_request', 'already waiting')
-    const pending = this.takeForWait(s.name, from)
-    if (pending.length) return { messages: pending, timed_out: false }
+    // Rows the standby already took are information, not a reason to return: they ride along
+    // with the next real batch. Look first, take only when there is something to take.
+    if (this.glanceUnread(s.name).some((m) => !from || m.from === from)) {
+      const taken = this.takeForWait(s.name, from)
+      return { ...taken, timed_out: false } satisfies WaitResult
+    }
     const timer = setTimeout(() => {
       if (s.waiting?.requestId !== requestId) return
       s.waiting = null
@@ -546,11 +660,20 @@ export class Bus extends EventEmitter<BusEvents> {
         type: 'response',
         id: requestId,
         ok: true,
-        result: { messages: [], timed_out: true },
+        result: { messages: [], standby: [], timed_out: true } satisfies WaitResult,
       })
     }, timeoutS * 1000)
     s.waiting = { requestId, timer, ...(from ? { from } : {}) }
     return PENDING
+  }
+
+  /** Unread rows without touching any cursor (not even the standby's shown-once cursor). */
+  private glanceUnread(name: string): Message[] {
+    const out: Message[] = []
+    for (const room of this.store.roomsOf(name))
+      for (const m of this.store.unreadFor(name, room, this.store.getCursor(name, room), 500))
+        out.push(m)
+    return out
   }
 
   /**
@@ -558,11 +681,12 @@ export class Bus extends EventEmitter<BusEvents> {
    * sender — only that sender's rows, marked seen one by one so everyone else's stay unread
    * for the next `inbox` / hook pull instead of being swallowed by the cursor.
    */
-  private takeForWait(name: string, from?: string): Message[] {
-    if (!from) return this.inbox(name)
-    const mine = this.inbox(name, true).filter((m) => m.from === from)
+  private takeForWait(name: string, from?: string): InboxResult {
+    if (!from) return this.inboxFull(name)
+    const all = this.inboxFull(name, true)
+    const mine = all.messages.filter((m) => m.from === from)
     for (const m of mine) this.store.markSeen(m.id, name)
-    return mine
+    return { messages: mine, standby: all.standby }
   }
 
   private resolveWait(s: Session): void {
@@ -570,12 +694,12 @@ export class Bus extends EventEmitter<BusEvents> {
     if (!w) return
     clearTimeout(w.timer)
     s.waiting = null
-    const messages = this.takeForWait(s.name, w.from)
+    const taken = this.takeForWait(s.name, w.from)
     s.conn.send({
       type: 'response',
       id: w.requestId,
       ok: true,
-      result: { messages, timed_out: false },
+      result: { ...taken, timed_out: false } satisfies WaitResult,
     })
   }
 
@@ -629,6 +753,7 @@ export class Bus extends EventEmitter<BusEvents> {
     if (swept.length) this.emit('presence')
     for (const t of this.tasks.sweep(this.now()))
       this.system('task_budget', t.room, { task_id: t.id, reason: 'deadline' })
+    for (const name of this.registry.standbyNames()) this.standbySweep(name)
     const cutoff = this.now() - this.config.mailbox.ttl_hours * 3_600_000
     for (const a of this.store.listAgents()) {
       const dropped = this.store.expirePending(a.name, cutoff)

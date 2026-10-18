@@ -391,3 +391,292 @@ describe('Bus housekeeping', () => {
     expect(store.events().some((e) => e.kind === 'undeliverable')).toBe(true)
   })
 })
+
+describe('Bus standby', () => {
+  type Inbox = { messages: { id: number; text: string }[]; standby: { id: number; text: string }[] }
+  type Sent = { message: { id: number }; deliveries: { via: string; state: string }[] }
+  const texts = (c: FakeConn) =>
+    c.events('message').map((e) => (e as { message: { text: string } }).message.text)
+
+  /** pipa is joined (relayer) with an interactive session and a standby driver; tita writes to it. */
+  function standbySetup(cfg: Record<string, unknown> = {}) {
+    // the fake clock jumps past delay_s in big steps: keep the heartbeat sweep out of the way
+    const s = setup({ standby: { delay_s: 60 }, heartbeat_timeout_ms: 10 * 3_600_000, ...cfg })
+    s.mk('tita')
+    const pipaToken = generateToken()
+    s.store.createAgent({ name: 'pipa', token_hash: hashToken(pipaToken), authority: 'relayer' })
+    const tita = new FakeConn()
+    const me = new FakeConn()
+    const sb = new FakeConn()
+    s.register(tita, 'tita')
+    const reg = (conn: FakeConn, caps: Record<string, unknown>, role = 'control') =>
+      s.call(conn, {
+        type: 'register',
+        name: 'pipa',
+        token: pipaToken,
+        role,
+        capabilities: { inbox: true, push: false, ...caps },
+      })
+    return { ...s, tita, me, sb, reg }
+  }
+
+  it('standby and interactive coexist under one name; a second standby is name_taken', () => {
+    const { me, sb, reg, bus, store } = standbySetup()
+    expect(reg(me, {}).ok).toBe(true)
+    expect(reg(sb, { standby: true, driver: { kind: 'acp' } }).ok).toBe(true)
+    expect(reg(new FakeConn(), { standby: true, driver: { kind: 'acp' } })).toMatchObject({
+      ok: false,
+      error: { code: 'name_taken' },
+    })
+    // the standby's adapter (tool) and the hook's short-lived tool connection both fit
+    expect(reg(new FakeConn(), { standby: true }, 'tool').ok).toBe(true)
+    expect(reg(new FakeConn(), {}, 'tool').ok).toBe(true)
+    // the standby did not overwrite what the interactive session declared
+    expect(store.getAgent('pipa')?.capabilities.driver).toBeUndefined()
+    expect(bus.agents().find((a) => a.name === 'pipa')).toMatchObject({
+      online: true,
+      standby: true,
+    })
+    expect(bus.registry.interactive('pipa')).toHaveLength(1)
+    // closing the interactive session keeps the name online through the standby
+    bus.disconnect(me)
+    expect(bus.agents().find((a) => a.name === 'pipa')).toMatchObject({ online: true })
+    bus.disconnect(sb)
+    expect(bus.agents().find((a) => a.name === 'pipa')?.standby).toBe(false)
+  })
+
+  it('a row the interactive session reads in time never reaches the standby', () => {
+    const { tita, me, sb, reg, ok, bus, store } = standbySetup()
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const r = ok(tita, { type: 'send', to: 'pipa', text: 'q1' }) as unknown as Sent
+    expect(r.deliveries[0]).toMatchObject({ via: 'mailbox', state: 'written' })
+    expect(texts(sb)).toEqual([]) // nothing pushed yet: the person has delay_s
+    now += 30_000
+    const inbox = ok(me, { type: 'inbox' }) as unknown as Inbox
+    expect(inbox.messages.map((m) => m.text)).toEqual(['q1'])
+    expect(inbox.standby).toEqual([])
+    now += 60_000
+    bus.tick()
+    expect(texts(sb)).toEqual([])
+    expect(store.getDelivery(r.message.id, 'pipa')).toMatchObject({ via: 'mailbox', state: 'seen' })
+    expect((ok(sb, { type: 'inbox' }) as unknown as Inbox).messages).toEqual([])
+  })
+
+  it('a parked wait of the person wins over the standby', () => {
+    const { tita, me, sb, reg, ok, call } = standbySetup()
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    expect(isPendingResponse(call(me, { type: 'wait', timeout_s: 5 }))).toBe(true)
+    const r = ok(tita, { type: 'send', to: 'pipa', text: 'for the person' }) as unknown as Sent
+    expect(r.deliveries[0]).toMatchObject({ via: 'wait', state: 'seen' })
+    expect(me.responses().at(-1)).toMatchObject({
+      ok: true,
+      result: { timed_out: false, messages: [expect.objectContaining({ text: 'for the person' })] },
+    })
+    expect(texts(sb)).toEqual([])
+    // the standby cannot park a wait of its own
+    expect(call(sb, { type: 'wait', timeout_s: 5 })).toMatchObject({
+      ok: false,
+      error: { code: 'bad_request' },
+    })
+  })
+
+  it('after delay_s the standby gets the row, answers it, and the person sees it once, flagged', () => {
+    const { tita, me, sb, reg, ok, call, bus, store } = standbySetup()
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const r = ok(tita, { type: 'send', to: 'pipa', text: 'q2' }) as unknown as Sent
+    now += 61_000
+    bus.tick()
+    expect(texts(sb)).toEqual(['q2'])
+    expect(store.getDelivery(r.message.id, 'pipa')).toMatchObject({
+      via: 'standby',
+      state: 'written',
+    })
+    expect(store.events().some((e) => e.kind === 'standby')).toBe(true)
+
+    // the standby's inbox: only its rows; marks them seen without moving the person's cursor
+    const sbInbox = ok(sb, { type: 'inbox' }) as unknown as Inbox
+    expect(sbInbox.messages.map((m) => m.text)).toEqual(['q2'])
+    expect(sbInbox.standby).toEqual([])
+    expect(store.getDelivery(r.message.id, 'pipa')?.state).toBe('seen')
+    expect(store.getCursor('pipa', 'dm:pipa|tita')).toBe(0)
+    expect((ok(sb, { type: 'inbox' }) as unknown as Inbox).messages).toEqual([])
+
+    // the standby replies as pipa: the row is handled; tita receives the reply normally
+    const reply = ok(sb, { type: 'send', to: 'tita', text: 'a2' }) as unknown as Sent
+    expect(store.getDelivery(r.message.id, 'pipa')?.state).toBe('handled')
+    expect(reply.deliveries[0]).toMatchObject({ via: 'mailbox', state: 'written' })
+    expect((ok(tita, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      'a2',
+    ])
+    expect(store.getCursor('pipa', 'dm:pipa|tita')).toBe(0)
+
+    // a parked wait of the person is not woken by what the standby handled
+    expect(isPendingResponse(call(me, { type: 'wait', timeout_s: 5 }))).toBe(true)
+    bus.disconnect(me)
+    reg(me, {})
+    // the person's next look (a hook peek) shows q2 once, under `standby`, not as unread...
+    const peek = ok(me, { type: 'inbox', peek: true }) as unknown as Inbox
+    expect(peek.messages).toEqual([])
+    expect(peek.standby.map((m) => m.text)).toEqual(['q2'])
+    // ...and never again, while an ordinary row still goes the normal way
+    ok(tita, { type: 'send', to: 'pipa', text: 'q3' })
+    const next = ok(me, { type: 'inbox' }) as unknown as Inbox
+    expect(next.messages.map((m) => m.text)).toEqual(['q3'])
+    expect(next.standby).toEqual([])
+    expect(store.getDelivery(r.message.id, 'pipa')?.state).toBe('handled')
+  })
+
+  it('a pushed row reaches the standby only once push has degraded and the delay passed', () => {
+    const { tita, me, sb, reg, ok, bus, store } = standbySetup({ push: { seen_timeout_s: 0.01 } })
+    reg(me, { push: true })
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const r = ok(tita, { type: 'send', to: 'pipa', text: 'pushed' }) as unknown as Sent
+    expect(r.deliveries[0]).toMatchObject({ via: 'push' })
+    expect(texts(me)).toEqual(['pushed'])
+    expect(texts(sb)).toEqual([])
+    now += 61_000
+    bus.tick()
+    expect(store.getDelivery(r.message.id, 'pipa')?.via).toBe('standby')
+    expect(texts(sb)).toEqual(['pushed'])
+  })
+
+  it('a standby that connects late takes what is already overdue and times the rest', () => {
+    const { tita, me, sb, reg, ok, bus, store } = standbySetup()
+    reg(me, {})
+    const old = ok(tita, { type: 'send', to: 'pipa', text: 'old' }) as unknown as Sent
+    now += 61_000
+    const fresh = ok(tita, { type: 'send', to: 'pipa', text: 'fresh' }) as unknown as Sent
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    expect(texts(sb)).toEqual(['old'])
+    expect(store.getDelivery(fresh.message.id, 'pipa')?.via).toBe('mailbox')
+    now += 61_000
+    bus.tick()
+    expect(texts(sb)).toEqual(['old', 'fresh'])
+    expect(store.getDelivery(old.message.id, 'pipa')?.via).toBe('standby')
+    // an interactive reconnect does not pull the standby's rows back
+    bus.disconnect(me)
+    reg(me, {})
+    expect(store.pendingFor('pipa')).toEqual([])
+  })
+
+  it('the timer hands over without a tick', async () => {
+    const { tita, me, sb, reg, ok, store } = standbySetup({ standby: { delay_s: 0.02 } })
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const r = ok(tita, { type: 'send', to: 'pipa', text: 'soon' }) as unknown as Sent
+    await new Promise((res) => setTimeout(res, 80))
+    expect(store.getDelivery(r.message.id, 'pipa')?.via).toBe('standby')
+    expect(texts(sb)).toEqual(['soon'])
+  })
+
+  it('a task handed to the standby is worked by it; the person sees the thread once, flagged', () => {
+    const { tita, me, sb, reg, ok, bus, store } = standbySetup()
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const created = ok(tita, {
+      type: 'task_create',
+      to: 'pipa',
+      description: 'run the tests',
+    }) as unknown as { task: { id: string; room: string } }
+    now += 61_000
+    bus.tick()
+    const got = ok(sb, { type: 'inbox' }) as unknown as Inbox
+    expect(got.messages).toHaveLength(1)
+    expect(got.messages[0]?.text).toContain(created.task.id)
+    // the standby's adapter (tool connection) reports progress as pipa
+    const sbTool = new FakeConn()
+    reg(sbTool, { standby: true }, 'tool')
+    ok(sbTool, { type: 'task_update', task_id: created.task.id, state: 'working' })
+    ok(sbTool, {
+      type: 'task_update',
+      task_id: created.task.id,
+      state: 'completed',
+      summary: 'green',
+    })
+    expect(store.getTask(created.task.id)?.state).toBe('completed')
+    expect(store.getDelivery(got.messages[0]?.id as number, 'pipa')?.state).toBe('handled')
+    // tita (the dispatcher) got both updates the normal way
+    expect((ok(tita, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      expect.stringContaining('submitted → working'),
+      expect.stringContaining('working → completed'),
+    ])
+    // the person's session: the task row is shown once as handled by standby, nothing unread
+    const mine = ok(me, { type: 'inbox' }) as unknown as Inbox
+    expect(mine.messages).toEqual([])
+    expect(mine.standby.map((m) => m.text)).toEqual([expect.stringContaining(created.task.id)])
+    expect((ok(me, { type: 'inbox' }) as unknown as Inbox).standby).toEqual([])
+  })
+})
+
+describe('Bus send and unread rows', () => {
+  type Inbox = { messages: { text: string }[] }
+  type Sent = { message: { id: number } }
+
+  it('a send handles what the sender read, not a reply that arrived meanwhile (crossed questions)', () => {
+    const { mk, ok, register, store } = setup()
+    mk('pipa')
+    mk('tita')
+    const p = new FakeConn()
+    const t = new FakeConn()
+    register(p, 'pipa')
+    register(t, 'tita')
+    const q1 = ok(p, { type: 'send', to: 'tita', text: 'your cpu?' }) as unknown as Sent
+    // tita reads pipa's question and asks its own
+    expect((ok(t, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      'your cpu?',
+    ])
+    ok(t, { type: 'send', to: 'pipa', text: 'your memory?' })
+    // pipa answers while tita is still busy measuring
+    const a2 = ok(p, { type: 'send', to: 'tita', text: 'memory 38%' }) as unknown as Sent
+    // tita sends its answer: the question it read is handled, pipa's answer is not swallowed
+    ok(t, { type: 'send', to: 'pipa', text: 'cpu 4%' })
+    expect(store.getDelivery(q1.message.id, 'tita')?.state).toBe('handled')
+    expect(store.getDelivery(a2.message.id, 'tita')?.state).toBe('written')
+    expect((ok(t, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      'memory 38%',
+    ])
+  })
+
+  it('a row handed to the standby mid-turn is not marked handled by its earlier reply', () => {
+    const s = setup({ standby: { delay_s: 60 }, heartbeat_timeout_ms: 10 * 3_600_000 })
+    s.mk('tita')
+    const token = generateToken()
+    s.store.createAgent({ name: 'pipa', token_hash: hashToken(token), authority: 'relayer' })
+    const tita = new FakeConn()
+    const me = new FakeConn()
+    const sb = new FakeConn()
+    s.register(tita, 'tita')
+    const reg = (c: FakeConn, caps: Record<string, unknown>) =>
+      s.call(c, {
+        type: 'register',
+        name: 'pipa',
+        token,
+        role: 'control',
+        capabilities: { inbox: true, push: false, ...caps },
+      })
+    reg(me, {})
+    reg(sb, { standby: true, driver: { kind: 'acp' } })
+    const first = s.ok(tita, { type: 'send', to: 'pipa', text: 'one' }) as unknown as Sent
+    now += 61_000
+    s.bus.tick()
+    expect((s.ok(sb, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      'one',
+    ])
+    // while the standby works on "one", "two" becomes overdue and is handed over too
+    const second = s.ok(tita, { type: 'send', to: 'pipa', text: 'two' }) as unknown as Sent
+    now += 61_000
+    s.bus.tick()
+    s.ok(sb, { type: 'send', to: 'tita', text: 'answer to one' })
+    expect(s.store.getDelivery(first.message.id, 'pipa')?.state).toBe('handled')
+    expect(s.store.getDelivery(second.message.id, 'pipa')).toMatchObject({
+      via: 'standby',
+      state: 'written',
+    })
+    expect((s.ok(sb, { type: 'inbox' }) as unknown as Inbox).messages.map((m) => m.text)).toEqual([
+      'two',
+    ])
+  })
+})

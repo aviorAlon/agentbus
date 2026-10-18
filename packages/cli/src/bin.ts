@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { A2AGateway } from '@agentbus/a2a'
-import { renderMessages, runAdapter } from '@agentbus/adapter'
+import { renderMessages, renderStandby, runAdapter } from '@agentbus/adapter'
 import {
   auditJsonl,
   BlobStore,
@@ -22,18 +22,8 @@ import {
   verifyToken,
   WsServer,
 } from '@agentbus/core'
-import {
-  AcpBackend,
-  ApiBackend,
-  type Backend,
-  CliBackend,
-  Driver,
-  DriversConfig,
-  defaultAcpCommand,
-  defaultModes,
-  resolveToken,
-} from '@agentbus/driver'
-import type { AgentInfo, Message, Task } from '@agentbus/protocol'
+import { type Driver, DriversConfig, resolveToken } from '@agentbus/driver'
+import type { AgentInfo, InboxResult, Message, Task } from '@agentbus/protocol'
 import {
   dmRoom,
   encodeRecords,
@@ -44,9 +34,16 @@ import {
 } from '@agentbus/protocol'
 import { Command } from 'commander'
 import YAML from 'yaml'
-import { adapterCommand } from './adapter-command.js'
 import { busFor, registerAgentCommands } from './agent-cli.js'
-import { httpBaseFromBus, joinHost, leaveHost, nameFromDir, readAgentToken } from './join.js'
+import { makeDriver, StandbyManager, type StandbyStatus } from './drivers.js'
+import {
+  httpBaseFromBus,
+  joinHost,
+  leaveHost,
+  nameFromDir,
+  readAgentBus,
+  readAgentToken,
+} from './join.js'
 import { ensureDir, expandHome, readOwnerToken, writeOwnerToken } from './paths.js'
 
 const VERSION = '0.0.0'
@@ -154,7 +151,14 @@ interface RunningBus {
  */
 function joinRoute(
   bus: Bus,
-  where: () => { http: string; bus: string; publicBus: string; publicHttp: string },
+  where: () => {
+    http: string
+    bus: string
+    publicBus: string
+    publicHttp: string
+    /** Standby drivers of this process (`up`); null under `serve`. */
+    standby: StandbyManager | null
+  },
 ): HttpRoute {
   return async (req, res, url) => {
     const reply = (status: number, body: unknown) => {
@@ -164,20 +168,44 @@ function joinRoute(
     }
     if (url.pathname === '/api/console/info' && req.method === 'GET') {
       const w = where()
-      return reply(200, { bus: w.publicBus, http: w.publicHttp })
+      return reply(200, { bus: w.publicBus, http: w.publicHttp, standby: w.standby !== null })
     }
-    if (url.pathname !== '/api/console/join' || req.method !== 'POST') return false
+    const isJoin = url.pathname === '/api/console/join' && req.method === 'POST'
+    const isStandby = url.pathname === '/api/console/standby' && req.method === 'GET'
+    const isReload = url.pathname === '/api/console/standby/reload' && req.method === 'POST'
+    if (!isJoin && !isStandby && !isReload) return false
     const auth = req.headers.authorization ?? ''
     const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
     const name = String(req.headers['x-agentbus-name'] ?? '')
     const human = name ? bus.store.getAgent(name) : null
     if (!token || !human || human.authority !== 'human' || !verifyToken(token, human.token_hash))
       return reply(401, {
-        error: { code: 'unauthorized', message: 'console join needs a human token' },
+        error: { code: 'unauthorized', message: 'this endpoint needs a human token' },
       })
+    // ---- standby: what `up` hosts for joined directories; reload re-reads the registrations
+    if (isStandby || isReload) {
+      const w = where()
+      if (!w.standby)
+        return reply(404, {
+          error: {
+            code: 'not_implemented',
+            message: 'this bus runs without standby drivers (agentbus serve); use agentbus up',
+          },
+        })
+      // A slow backend (first npx fetch) must not hold the caller: answer within 15 s with `starting`.
+      const standby = isReload ? await w.standby.reloadWithin(15_000) : w.standby.status()
+      return reply(200, { standby })
+    }
     let body = ''
     for await (const c of req) body += c
-    let parsed: { host?: string; dir?: string; name?: string; authority?: string; hook?: boolean }
+    let parsed: {
+      host?: string
+      dir?: string
+      name?: string
+      authority?: string
+      hook?: boolean
+      standby?: boolean
+    }
     try {
       parsed = JSON.parse(body || '{}')
     } catch {
@@ -198,16 +226,54 @@ function joinRoute(
         authority: parsed.authority === 'bot' ? 'bot' : 'relayer',
         owner: { name, token },
         noHook: parsed.hook === false,
+        noStandby: parsed.standby === false,
       })
-      return reply(200, r)
+      // Same process: hot-load the new standby driver right away.
+      const standby = w.standby ? await w.standby.reloadWithin(15_000) : null
+      return reply(200, { ...r, ...(standby ? { standby } : {}) })
     } catch (e) {
       return reply(400, { error: { code: 'bad_request', message: (e as Error).message } })
     }
   }
 }
 
+/**
+ * `agentbus join` on the command line: ask a running `up` to start the standby driver for the
+ * directory that was just registered. Returns a line for the user, never throws (the join
+ * itself succeeded; standby just starts later).
+ */
+async function requestStandbyReload(
+  http: string,
+  owner: { name: string; token: string },
+  name: string,
+): Promise<string> {
+  try {
+    const r = await fetch(`${http}/api/console/standby/reload`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${owner.token}`, 'x-agentbus-name': owner.name },
+    })
+    if (r.status === 404)
+      return 'standby: the bus is running without standby drivers (agentbus serve). Start it with "agentbus up" to host this directory while you are away.'
+    if (!r.ok)
+      return `standby: the bus refused the reload (${r.status}): ${(await r.text()).slice(0, 200)}`
+    const { standby } = (await r.json()) as { standby: StandbyStatus[] }
+    const mine = standby.find((s) => s.name === name)
+    if (!mine) return 'standby: registered; "agentbus up" will start it on its next reload'
+    if (mine.state === 'running')
+      return `standby: running (${mine.backend} session hosted by agentbus up for ${mine.cwd})`
+    if (mine.state === 'starting')
+      return `standby: starting (${mine.backend} session for ${mine.cwd}; "agentbus up" logs [standby ${name}] ready or failed)`
+    return `standby: failed to start: ${mine.error ?? 'unknown'}. Is ${mine.backend} installed and logged in on this machine? It is retried on the next join / reload.`
+  } catch (e) {
+    return `standby: could not reach the bus over HTTP (${(e as Error).message}); "agentbus up" will start it when it next reloads`
+  }
+}
+
 /** Open the store, mint the owner token on first run, start WS/HTTP, log the endpoints. */
-async function startBus(cfg: BusConfig): Promise<RunningBus> {
+async function startBus(
+  cfg: BusConfig,
+  standby: () => StandbyManager | null = () => null,
+): Promise<RunningBus> {
   {
     const { store, dataDir } = openStore(cfg)
     const minted = ensureOwner(store, dataDir)
@@ -233,6 +299,7 @@ async function startBus(cfg: BusConfig): Promise<RunningBus> {
           bus: wsForJoin,
           publicBus: `${publicBase.replace(/^http/, 'ws').replace(/\/$/, '')}/ws`,
           publicHttp: publicBase,
+          standby: standby(),
         })),
       ],
       ...(staticDir ? { staticDir } : {}),
@@ -309,6 +376,7 @@ program
   .option('--role <r>', 'control | tool', 'control')
   .option('--backend <b>')
   .option('--push', 'declare Claude Code channel (preview)', false)
+  .option('--standby', 'serve the standby driver of this name (set by the driver itself)', false)
   .action(
     async (o: {
       bus: string
@@ -317,6 +385,7 @@ program
       role: 'control' | 'tool'
       backend?: string
       push: boolean
+      standby: boolean
     }) => {
       const name = o.name ?? process.env.AGENTBUS_NAME ?? nameFromDir(process.cwd())
       const t = o.token ?? process.env.AGENTBUS_TOKEN ?? readAgentToken(name)
@@ -331,6 +400,7 @@ program
         token: t,
         role: o.role,
         push: o.push,
+        standby: o.standby,
         cwd: process.cwd(),
         version: VERSION,
         ...(o.backend ? { backend: o.backend } : {}),
@@ -349,7 +419,10 @@ program
     if (!cfg.agents.length) throw new Error('drivers.yaml has no agents')
     const drivers: Driver[] = []
     for (const a of cfg.agents) {
-      const d = makeDriver(a, cfg.bus, resolveToken(a))
+      // A standby entry for a joined directory has its token in ~/.agentbus/agents/<name>.token.
+      const token =
+        (a.standby && !a.token && !a.token_env && readAgentToken(a.name)) || resolveToken(a)
+      const d = makeDriver(a, cfg.bus, token, log)
       await d.start()
       drivers.push(d)
     }
@@ -360,71 +433,6 @@ program
     process.on('SIGINT', shutdown)
     process.on('SIGTERM', shutdown)
   })
-
-type AgentCfg = DriversConfig['agents'][number]
-
-/** Backend + Driver for one drivers.yaml entry. */
-function makeDriver(a: AgentCfg, busUrl: string, token: string): Driver {
-  {
-    let backend: Backend
-    let kind: 'acp' | 'cli' | 'api' = 'acp'
-    if (a.backend === 'api') {
-      if (!a.api) throw new Error(`agent ${a.name}: backend api needs an api: block`)
-      const apiKey = a.api.api_key_env ? process.env[a.api.api_key_env] : undefined
-      backend = new ApiBackend({
-        baseUrl: a.api.base_url,
-        model: a.api.model,
-        maxIterations: a.api.max_iterations,
-        ...(apiKey ? { apiKey } : {}),
-        ...(a.api.system_prompt ? { systemPrompt: a.api.system_prompt } : {}),
-        log,
-      })
-      kind = 'api'
-    } else if (a.backend === 'cli') {
-      if (!a.cli) throw new Error(`agent ${a.name}: backend cli needs a cli: block`)
-      backend = new CliBackend({
-        command: a.cli.command,
-        argsFirst: a.cli.args_first,
-        argsResume: a.cli.args_resume,
-        env: a.cli.env,
-        ...(a.cli.session_id_regex ? { sessionIdRegex: a.cli.session_id_regex } : {}),
-        log,
-      })
-      kind = 'cli'
-    } else {
-      const launch = a.acp ?? defaultAcpCommand(a.backend)
-      if (!launch)
-        throw new Error(`agent ${a.name}: backend ${a.backend} needs an explicit acp.command`)
-      backend = new AcpBackend({
-        command: launch.command,
-        args: launch.args,
-        ...(a.acp?.env ? { env: a.acp.env } : {}),
-        autonomy: a.autonomy,
-        modes: [...(a.acp?.mode ? [a.acp.mode] : []), ...defaultModes(a.backend, a.autonomy)],
-        log,
-      })
-    }
-    return new Driver({
-      bus: busUrl,
-      name: a.name,
-      token,
-      backendName: a.backend,
-      cwd: expandHome(a.cwd),
-      backend,
-      adapterCommand: adapterCommand(),
-      kind,
-      batchWindowMs: a.batch_window_ms,
-      turnTimeoutMs: a.turn_timeout_s * 1000,
-      maxAttempts: a.max_attempts,
-      permissionTimeoutMs: a.permission_timeout_s * 1000,
-      log,
-      onTurn: (t) =>
-        log(
-          `[turn ${t.agent}] ${t.messageIds.length} msg, ${t.endedAt - t.startedAt}ms, ${t.exitReason}`,
-        ),
-    })
-  }
-}
 
 // ------------------------------------------------------------------ up (bus + drivers in one process)
 
@@ -468,13 +476,25 @@ program
         ? DriversConfig.parse(YAML.parse(readFileSync(o.drivers, 'utf8')) ?? {})
         : DriversConfig.parse({})
       if (!existsSync(o.drivers)) log(`[up] no ${o.drivers}; running the bus only`)
-      const running = await startBus(cfg)
+      let standby: StandbyManager | null = null
+      const running = await startBus(cfg, () => standby)
+      standby = new StandbyManager({
+        busUrl: running.wsUrl,
+        local: {
+          port: running.port,
+          hosts: [...(cfg.public_host ? [cfg.public_host] : []), firstLanIp()],
+        },
+        log,
+      })
       const drivers: Driver[] = []
       for (const a of dcfg.agents) {
         // Same process as the bus: we own the store, so a missing or unspecified token is
-        // simply minted (or rotated) here and never has to be copied around.
+        // simply minted (or rotated) here and never has to be copied around. A standby entry
+        // for a joined directory keeps that directory's own token.
         let token: string
+        const joined = a.standby ? readAgentToken(a.name) : null
         if (a.token || (a.token_env && process.env[a.token_env])) token = resolveToken(a)
+        else if (joined) token = joined
         else {
           token = generateToken()
           if (running.store.getAgent(a.name)) {
@@ -489,18 +509,27 @@ program
             log(`[up] ${a.name}: created`)
           }
         }
-        const d = makeDriver(a, running.wsUrl, token)
+        const d = makeDriver(a, running.wsUrl, token, log)
         await d.start()
         drivers.push(d)
       }
+      // Standby drivers for every joined directory on this machine (~/.agentbus/agents/*.standby).
+      const sb = await standby.reload()
+      const hosted = sb.filter((s) => s.state === 'running').map((s) => s.name)
       log(
         dcfg.agents.length
           ? `[up] ready: ${dcfg.agents.map((a) => a.name).join(', ')} — try: agentbus chat --to ${dcfg.agents[0]?.name}`
           : '[up] ready (bus only) — add agents with: agentbus join --claude | --codex, or the console',
       )
+      log(
+        hosted.length
+          ? `[up] standby for: ${hosted.join(', ')} (joined directories; they answer when nobody reads there within ${cfg.standby.delay_s}s)`
+          : '[up] standby: none yet (every "agentbus join" on this machine registers one)',
+      )
       const shutdown = async () => {
         log('[up] stopping')
         await Promise.all(drivers.map((d) => d.stop()))
+        await standby?.stopAll()
         await running.server.close()
         running.store.close()
         process.exit(0)
@@ -542,9 +571,11 @@ hook
       })
       // peek: the rows stay unread, so the agent's own `inbox` call in the turn shows them again and
       // marks them; a row the model ignored is injected at the next prompt too instead of being lost.
-      const r = await c.request<{ messages: Message[] }>({ type: 'inbox', peek: true })
+      const r = await c.request<InboxResult>({ type: 'inbox', peek: true })
       const parts: string[] = []
       if (r.messages.length) parts.push(renderMessages(r.messages), hookGuidance(name))
+      // What the standby took while nobody read here: shown once, information only.
+      if (r.standby?.length) parts.push(renderStandby(r.standby))
       // The prompt names another agent ("tita 你电脑…", "问 tita …", "@tita …"): say so, deterministically,
       // so the model does not answer about its own machine. Small models get this wrong on their own.
       if (stdin?.prompt) {
@@ -667,6 +698,11 @@ program
   .option('--bus <url>', 'bus WebSocket URL', 'ws://127.0.0.1:7777/ws')
   .option('--authority <a>', 'relayer (a person is at the keyboard) | bot', 'relayer')
   .option('--no-hook', 'Claude: do not install the UserPromptSubmit hook')
+  .option(
+    '--no-standby',
+    'do not host a standby session for this directory while nobody reads it (default: on)',
+  )
+  .option('--standby-autonomy <a>', 'standby permissions: full | ask', 'full')
   .option('--token <t>', 'owner token (default: ~/.agentbus/owner.token)')
   .option('--invite <code>', 'one-time invite from the bus operator (another machine)')
   .option('--as <name>', 'human participant name', OWNER)
@@ -681,6 +717,8 @@ program
       bus: string
       authority: 'bot' | 'relayer'
       hook: boolean
+      standby: boolean
+      standbyAutonomy: string
       token?: string
       invite?: string
       as: string
@@ -688,20 +726,31 @@ program
       dataDir?: string
     }) => {
       if (!o.claude && !o.codex) throw new Error('say which host: --claude or --codex')
+      if (o.standbyAutonomy !== 'full' && o.standbyAutonomy !== 'ask')
+        throw new Error('--standby-autonomy must be full or ask')
       const cfg = readConfig(o.config, o.dataDir ? { data_dir: o.dataDir } : {})
+      const owner = o.invite ? null : { name: o.as, token: humanToken(cfg, o.token) }
       const r = await joinHost({
         host: o.claude ? 'claude' : 'codex',
         ...(o.dir ? { dir: o.dir } : {}),
         ...(o.name ? { name: o.name } : {}),
         bus: o.bus,
         authority: o.authority,
-        ...(o.invite
-          ? { invite: o.invite }
-          : { owner: { name: o.as, token: humanToken(cfg, o.token) } }),
+        ...(o.invite ? { invite: o.invite } : { owner: owner as { name: string; token: string } }),
         noHook: !o.hook,
+        noStandby: !o.standby,
+        standbyAutonomy: o.standbyAutonomy,
       })
       for (const st of r.steps) log(`- ${st}`)
-      process.stdout.write(`joined as "${r.name}" (${r.host}, ${r.authority})\n${r.next}\n`)
+      // Tell a running `up` on this machine (same bus) to pick the standby up now.
+      const standbyLine = owner
+        ? await requestStandbyReload(httpBaseFromBus(o.bus), owner, r.name)
+        : r.standbyFile
+          ? 'standby: registered on this machine; it needs "agentbus up" running HERE (the bus is elsewhere) — or a drivers.yaml entry with standby: true for "agentbus driver"'
+          : null
+      process.stdout.write(
+        `joined as "${r.name}" (${r.host}, ${r.authority})\n${r.next}\n${standbyLine ? `${standbyLine}\n` : ''}`,
+      )
     },
   )
 
@@ -713,8 +762,22 @@ program
   .option('--dir <dir>')
   .option('--name <name>')
   .option('--purge', 'also delete the local token file', false)
+  .option('--token <t>', 'owner token, to stop the standby in a running "agentbus up" now')
+  .option('--as <name>', 'human participant name', OWNER)
+  .option('-c, --config <file>')
+  .option('--data-dir <dir>')
   .action(
-    (o: { claude?: boolean; codex?: boolean; dir?: string; name?: string; purge: boolean }) => {
+    async (o: {
+      claude?: boolean
+      codex?: boolean
+      dir?: string
+      name?: string
+      purge: boolean
+      token?: string
+      as: string
+      config?: string
+      dataDir?: string
+    }) => {
       if (!o.claude && !o.codex) throw new Error('say which host: --claude or --codex')
       const r = leaveHost({
         host: o.claude ? 'claude' : 'codex',
@@ -723,6 +786,20 @@ program
         purge: o.purge,
       })
       for (const st of r.steps) log(`- ${st}`)
+      // Best effort: a running `up` on this bus drops the standby driver now rather than at its next reload.
+      const busUrl = readAgentBus(r.name)
+      if (r.steps.some((s) => s.startsWith('standby registration removed')) && busUrl) {
+        try {
+          const cfg = readConfig(o.config, o.dataDir ? { data_dir: o.dataDir } : {})
+          const owner = { name: o.as, token: humanToken(cfg, o.token) }
+          await fetch(`${httpBaseFromBus(busUrl)}/api/console/standby/reload`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${owner.token}`, 'x-agentbus-name': owner.name },
+          })
+        } catch {
+          // no owner token here or no bus: `up` stops it on its next reload
+        }
+      }
       process.stdout.write(`left as "${r.name}"\n`)
     },
   )
@@ -839,7 +916,7 @@ common(program.command('status').description('agents and rooms')).action(async (
   const a = await c.request<{ agents: AgentInfo[] }>({ type: 'agents' })
   process.stdout.write(
     `${encodeRecords(
-      ['name', 'backend', 'authority', 'online', 'state', 'driver', 'inbox', 'push'],
+      ['name', 'backend', 'authority', 'online', 'state', 'driver', 'standby', 'inbox', 'push'],
       a.agents.map((x) => ({
         name: x.name,
         backend: x.backend ?? '',
@@ -847,6 +924,7 @@ common(program.command('status').description('agents and rooms')).action(async (
         online: x.online,
         state: x.state,
         driver: x.capabilities.driver?.kind ?? '',
+        standby: x.standby === true,
         inbox: x.capabilities.inbox,
         push: x.capabilities.push,
       })),

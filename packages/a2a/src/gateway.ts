@@ -196,11 +196,14 @@ export class A2AGateway {
         const { text, context } = fromSdkMessage(ctx.userMessage)
         const existing = this.extToInt.get(ctx.taskId)
         if (!existing) {
-          const task = this.bus.tasks.create(this.dispatcher, {
-            to: agent,
-            description: text,
-            ...(context ? { context } : {}),
-          })
+          const task = this.bus.tasks.create(
+            { name: this.dispatcher },
+            {
+              to: agent,
+              description: text,
+              ...(context ? { context } : {}),
+            },
+          )
           this.extToInt.set(ctx.taskId, task.id)
           this.intToExt.set(task.id, { ext: ctx.taskId, agent, artifacts: 0 })
           eventBus.publish(AgentEvent.task(this.sdkTask(task, ctx.taskId)))
@@ -236,7 +239,11 @@ export class A2AGateway {
       cancelTask: async (extId: string, eventBus: ExecutionEventBus) => {
         const internal = this.extToInt.get(extId)
         if (!internal) throw new Error(`unknown task ${extId}`)
-        const task = this.bus.tasks.cancel(this.dispatcher, internal, 'canceled by A2A client')
+        const task = this.bus.tasks.cancel(
+          { name: this.dispatcher },
+          internal,
+          'canceled by A2A client',
+        )
         eventBus.publish(
           AgentEvent.statusUpdate({
             taskId: extId,

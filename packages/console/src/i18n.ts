@@ -45,6 +45,11 @@ const dict = {
     '会话由总线托管，有消息就会被叫醒',
     'Session held by the bus; woken on every message',
   ],
+  'badge.standby': ['待命', 'standby'],
+  'badge.standby.tip': [
+    '这个目录同时有一个托管会话待命：人没在约一分钟内读的消息和任务由它代答',
+    'A hosted session is on standby for this directory: it answers what the person leaves unread for about a minute',
+  ],
   'badge.relayer': ['人在用', 'in use'],
   'badge.relayer.tip': [
     '有人正在这个会话里工作，它在自己的回合里收发',

@@ -18,6 +18,8 @@ export interface AgentInfo {
   capabilities: { driver?: { kind: string }; inbox: boolean; push: boolean }
   cwd: string | null
   last_seen: number | null
+  /** A hosted session is on standby for this directory. */
+  standby?: boolean
 }
 export interface BlobRef {
   id: string

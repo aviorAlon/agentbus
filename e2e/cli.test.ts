@@ -93,7 +93,7 @@ describe('cli smoke', () => {
       dataDir,
     ])
     const lines = status.stdout.trim().split('\n')
-    expect(lines[0]).toBe('name|backend|authority|online|state|driver|inbox|push')
+    expect(lines[0]).toBe('name|backend|authority|online|state|driver|standby|inbox|push')
     expect(lines.some((l) => l.startsWith('gamma|codex|bot|false'))).toBe(true)
     expect(lines.some((l) => l.startsWith('owner||human|true'))).toBe(true)
 

@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+- **Standby hosting for joined directories.** `agentbus join` now registers the directory for standby (`~/.agentbus/agents/<name>.standby`; `--no-standby` to opt out, `--standby-autonomy ask` to keep permissions in your hands). `agentbus up` starts one standby driver per registration (backend from the host: `claude-code` / `codex`) and hot-loads new ones through `POST /api/console/standby/reload` (human token), which `join` calls; `GET /api/console/standby` lists them; `agentbus leave` unregisters. A `drivers.yaml` entry may say `standby: true` for the same thing.
+- Bus: per-connection capabilities and a `standby` role in the registry (one standby control and one standby tool per name, coexisting with the interactive connections; a second standby is `name_taken`). Delivery path `standby`: a mailbox / push row still unread after `standby.delay_s` (new `agentbus.yaml` key, default 60) is handed to the standby connection; a parked `wait` always wins. The standby's `inbox` returns only its rows and never moves the person's cursor; its `send` / `task_update` mark only those rows handled. The interactive session's `inbox` / `wait` carry a separate `standby` list of rows the standby took, shown once (hook, CLI and MCP render it as "already handled by your standby"). `AgentInfo.standby` and a console badge show when a standby is online.
+### Fixed
+- A `send` no longer swallows rows the sender never read. It used to advance the sender's read cursor and mark everything it had received in the room as handled, so when two sessions asked each other at the same time, the reply that arrived while one was busy was marked handled unseen and lost (`e2e/live-dialog.mjs crossed` failed intermittently). Now only rows the sender has seen, or that were pushed into its context, become handled, and the cursor moves only on `inbox` / `wait`.
+
+### Added (docs)
+- Skill, project note, user guide §3 / §9 and READMEs describe standby: token cost, no shared context with your session, concurrent edits in the same working tree, how to turn it off.
+
 First public release candidate. Everything below was built in the M0–M4 milestones of [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md).
 
 ### Bus (`@agentbus/core`, `@agentbus/protocol`)
